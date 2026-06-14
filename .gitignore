@@ -36,3 +36,6 @@ build/
 
 ### VS Code ###
 .vscode/
+
+### Claude Code（本地工具设置，不提交）###
+.claude/
