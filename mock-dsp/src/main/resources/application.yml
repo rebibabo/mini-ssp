@@ -1,0 +1,67 @@
+# 公共默认配置。具体行为由下面的 profile 覆盖。
+# 启动方式：./mvnw spring-boot:run -Dspring-boot.run.profiles=dsp-a
+spring:
+  application:
+    name: mock-dsp
+
+logging:
+  level:
+    com.example.mockdsp: INFO
+
+---
+# ===== DSP-A：8081，出价高、延迟低、稳定 =====
+spring:
+  config:
+    activate:
+      on-profile: dsp-a
+server:
+  port: 8081
+mock:
+  dsp:
+    name: dsp-001
+    min-bid-cents: 100
+    max-bid-cents: 500
+    latency-min-ms: 30
+    latency-max-ms: 100
+    no-bid-rate: 0.1
+    error-rate: 0.0
+    timeout-rate: 0.0
+
+---
+# ===== DSP-B：8082，出价更高、延迟中等 =====
+spring:
+  config:
+    activate:
+      on-profile: dsp-b
+server:
+  port: 8082
+mock:
+  dsp:
+    name: dsp-002
+    min-bid-cents: 200
+    max-bid-cents: 800
+    latency-min-ms: 50
+    latency-max-ms: 200
+    no-bid-rate: 0.2
+    error-rate: 0.0
+    timeout-rate: 0.0
+
+---
+# ===== DSP-C：8083，出价低、偶尔超时/异常（练习容错）=====
+spring:
+  config:
+    activate:
+      on-profile: dsp-c
+server:
+  port: 8083
+mock:
+  dsp:
+    name: dsp-003
+    min-bid-cents: 50
+    max-bid-cents: 300
+    latency-min-ms: 50
+    latency-max-ms: 120
+    no-bid-rate: 0.3
+    error-rate: 0.2
+    timeout-rate: 0.2
+    timeout-sleep-ms: 500

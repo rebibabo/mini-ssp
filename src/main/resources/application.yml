@@ -1,0 +1,67 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: mini-ssp
+  datasource:
+    # 敏感信息从环境变量/.env 读取（spring-dotenv 自动加载根目录 .env）；冒号后是本地默认值
+    url: ${DB_URL:jdbc:mysql://localhost:3306/mini_ssp?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8}
+    username: ${DB_USERNAME:root}
+    password: ${DB_PASSWORD}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      timeout: 3000ms
+  kafka:
+    bootstrap-servers: localhost:9092      # broker 地址(docker compose 起的那个)
+    producer:
+      # key 用 String，value(BidLog 对象)序列化成 JSON
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+    consumer:
+      group-id: ssp-bidlog-consumer         # 消费者组：同组内分摊消息，换组名可重头消费
+      auto-offset-reset: earliest           # 没有已记录的 offset 时(首次/新组)从最早开始读
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        # 反序列化 JSON 回对象时，信任这个包下的类(安全限制，防止反序列化任意类)
+        spring.json.trusted.packages: com.example.ssp.model.entity
+    listener:
+      type: batch                           # 批量消费：监听方法收 List，为批量入库做准备
+
+mybatis-plus:
+  mapper-locations: classpath:mapper/*.xml
+  configuration:
+    map-underscore-to-camel-case: true
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+
+ssp:
+  kafka:
+    bid-log-topic: bid-log                  # bid_log 消息的 topic 名
+  dsp:
+    # DSP 调用模式：mock=进程内模拟(默认,无需启动DSP服务) | http=WebClient 真实调用 8081-8083 的 Mock DSP
+    mode: mock
+  bid:
+    global-timeout-ms: 200
+    default-dsp-timeout-ms: 150
+    # 拍卖计价方式：first=一价(付出价) | second=二价(付第二高+增量)
+    auction-type: first
+    # 二价增量
+    price-increment: 0.01
+    thread-pool:
+      core-size: 8
+      max-size: 16
+      queue-capacity: 200
+      keep-alive-seconds: 60
+  cache:
+    enabled: false
+    slot-ttl-minutes: 10
+    dsp-ttl-minutes: 10
+    bid-result-ttl-minutes: 5
+
+logging:
+  level:
+    com.example.ssp: DEBUG
