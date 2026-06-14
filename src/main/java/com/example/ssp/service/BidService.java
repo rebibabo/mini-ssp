@@ -1,5 +1,6 @@
 package com.example.ssp.service;
 
+import com.example.ssp.cache.FrequencyCapService;
 import com.example.ssp.cache.RateLimiter;
 import com.example.ssp.cache.SlotCacheService;
 import com.example.ssp.exception.BizException;
@@ -7,13 +8,13 @@ import com.example.ssp.model.dto.*;
 import com.example.ssp.model.entity.AdSlot;
 import com.example.ssp.model.entity.BidLog;
 import com.example.ssp.model.entity.DspConfig;
+import com.example.ssp.service.bidlog.BidLogWriter;
 import com.example.ssp.service.dsp.DspCaller;
 import com.example.ssp.service.pricing.PricingStrategy;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
@@ -32,11 +33,13 @@ public class BidService {
 
     private final SlotCacheService slotCacheService;
     private final TrackService trackService;
-    // bid_log 不再直接写库，而是发到 Kafka，由消费者批量入库(解耦、不占竞价线程)
-    private final KafkaTemplate<String, BidLog> kafkaTemplate;
+    // bid_log 落库策略：按 ssp.bid-log.mode 注入 DirectBidLogWriter(直写) 或 KafkaBidLogWriter(发Kafka)
+    private final BidLogWriter bidLogWriter;
     // 策略接口：按 ssp.dsp.mode 配置注入 MockDspCaller(进程内) 或 DspBidClient(HTTP)
     private final DspCaller dspCaller;
     private final RateLimiter rateLimiter;
+    // 频次控制：按 (用户,DSP) 维度限制每日展示次数
+    private final FrequencyCapService frequencyCapService;
     // 计价策略：按 ssp.bid.auction-type 配置注入 FirstPricePricing(一价) 或 SecondPricePricing(二价)
     private final PricingStrategy pricingStrategy;
 
@@ -50,9 +53,9 @@ public class BidService {
     @Value("${ssp.bid.global-timeout-ms:200}")
     private long globalTimeoutMs;
 
-    // bid_log 消息发往的 Kafka topic
-    @Value("${ssp.kafka.bid-log-topic:bid-log}")
-    private String bidLogTopic;
+    // 频次上限：同一用户对同一 DSP 广告每天最多展示次数(0=不限)
+    @Value("${ssp.freq.daily-cap:3}")
+    private int freqDailyCap;
 
     /**
      * 核心竞价入口
@@ -69,6 +72,19 @@ public class BidService {
         if (dsps.isEmpty()) {
             log.warn("[Bid] no dsps for slot {}", request.getAdSlotId());
             return null;  // no fill
+        }
+
+        // 2.5 频次控制：剔除该用户今日已看够的 DSP（匿名用户无法追踪，跳过）
+        String userId = request.getUser() != null ? request.getUser().getUserId() : null;
+        if (userId != null && !userId.isBlank()) {
+            String uid = userId;  // lambda 需要 effectively final
+            dsps = dsps.stream()
+                    .filter(d -> !frequencyCapService.isCapped(uid, d.getDspId(), freqDailyCap))
+                    .toList();
+            if (dsps.isEmpty()) {
+                log.info("[Bid] all dsps frequency-capped for user {}, slot {}", uid, request.getAdSlotId());
+                return null;  // no fill
+            }
         }
 
         // 3. 并发向每个 DSP 发起竞价
@@ -132,8 +148,8 @@ public class BidService {
             winPrice = pricingStrategy.computeWinPrice(sortedBids, adSlot.getFloorPrice());
         }
 
-        // 8. 把每个 DSP 的竞价结果发到 Kafka(消费者批量入库)：传赢家 dspId 标记 win，成交价写到中标那条
-        sendBidLogs(request.getRequestId(), request.getAdSlotId(), allResults, winnerId, winPrice);
+        // 8. 落库本次竞价的 bid_log(直写 or Kafka 由 BidLogWriter 决定)：传赢家 dspId 标记 win，成交价写到中标那条
+        writeBidLogs(request.getRequestId(), request.getAdSlotId(), allResults, winnerId, winPrice);
 
         if (winner == null) return null;  // no fill
 
@@ -177,11 +193,10 @@ public class BidService {
     }
 
     /**
-     * 把每个 DSP 的竞价结果作为一条消息发到 Kafka，由消费者批量入库。
-     * kafkaTemplate.send 是非阻塞的(只往 producer 缓冲区追加，由 Kafka 客户端后台线程发送)，
-     * 所以这里直接在竞价线程调用即可，不再用 bidExecutor，竞价响应不受写日志影响。
+     * 拼装本次竞价的一批 bid_log，交给 BidLogWriter 落库（直写 or Kafka 由配置决定）。
      */
-    private void sendBidLogs(String requestId, String slotId, List<DspBidResult> results, String winnerId, BigDecimal winPrice) {
+    private void writeBidLogs(String requestId, String slotId, List<DspBidResult> results, String winnerId, BigDecimal winPrice) {
+        List<BidLog> logs = new ArrayList<>();
         for (DspBidResult result : results) {
             BidLog bidLog = new BidLog();
             bidLog.setRequestId(requestId);
@@ -207,9 +222,10 @@ public class BidService {
             // 成交价只写到中标那条记录（二价下 winPrice ≠ 该 DSP 的 bidPrice）
             bidLog.setWinPrice(isWinner ? winPrice : null);
 
-            // key 用 requestId：同一次竞价的多条进同一分区，保证有序、便于排查
-            kafkaTemplate.send(bidLogTopic, requestId, bidLog);
+            logs.add(bidLog);
         }
+        // 落库策略：DirectBidLogWriter 同步单条 / KafkaBidLogWriter 发 Kafka 由消费者批量入库
+        bidLogWriter.write(logs);
     }
 
     private BidResponse buildBidResponse(BidRequest request, DspBidResult winner, BigDecimal winPrice) {
@@ -217,6 +233,8 @@ public class BidService {
         BidResponse response = new BidResponse();
         response.setRequestId(request.getRequestId());
         response.setAdSlotId(request.getAdSlotId());
+        // userId 随结果缓存进 Redis，供曝光埋点做频次计数
+        response.setUserId(request.getUser() != null ? request.getUser().getUserId() : null);
         response.setWinDsp(winner.getDspId());
         // winPrice 由计价策略决定(一价=出价本身；二价=第二高+增量)
         response.setWinPrice(winPrice);

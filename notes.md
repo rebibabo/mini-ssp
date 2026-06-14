@@ -63,6 +63,21 @@
 - 验证：发竞价 → 1s 内 3 条落库；消费者日志「批量入库 3 条」；消费者组 LAG=0。
 - 单测：`BidServiceTest` mock 从 `BidLogMapper` 换成 `KafkaTemplate`，8 用例全过。
 
+### 2026-06-14 — 用户频次控制（Frequency Cap）
+
+- 区分：**频次控制 ≠ QPS 限流**——前者限「每用户对每 DSP 每天展示几次」(保护体验)，后者限「每 DSP 每秒接几个请求」(保护 DSP)。详见第 33 节。
+- 实现：新增 `FrequencyCapService`(Redis 按天固定窗口，用 `StringRedisTemplate` 做计数器)；**检查**在竞价时剔除看够的 DSP，**计数**在曝光埋点时 +1。
+- 配套：`BidResponse` 加 `userId`(随结果缓存进 Redis，曝光回调才知道是谁)；配置 `ssp.freq.daily-cap=3`；匿名用户跳过。
+- 验证：曝光后 `ssp:freq:{user}:{dsp}:{日期}` 计数 +1；把用户对三个 DSP 都设到上限 → 竞价返回 no fill。
+- 单测：`FrequencyCapServiceTest` 6 用例(达上限拦截/首次设 TTL 等)，全部 20 个单测通过。
+
+### 2026-06-14 — bid_log 写入加策略开关（direct/kafka）+ 写入压测
+
+- 用策略模式给 bid_log 落库加开关 `ssp.bid-log.mode`：`direct`(默认,同步单条直写,无需 Docker) | `kafka`(发 Kafka 消费者批量入库)。详见第 34 节。
+- 抽 `BidLogWriter` 接口 + `DirectBidLogWriter`/`KafkaBidLogWriter` 两实现；`BidService` 去掉 KafkaTemplate 依赖改依赖接口；`BidLogConsumer` 加 `@ConditionalOnProperty(kafka)`(direct 模式不连 Kafka)。
+- 微基准 `BidLogInsertBenchmarkTest`：批量 insertBatch 比循环单条 insert 快约 **7~10 倍**(100→7.5x / 500→10.5x / 1000→8.1x)，N 越大优势越明显。
+- 默认改 direct 后开箱即用、不必开 Docker，解决了"必须开 Docker 才能跑"的痛点。
+
 ---
 
 ## 1. 分层架构
@@ -1722,3 +1737,132 @@ batch 模式默认：监听方法**正常返回后**才提交 offset；若 `inse
 | 核心竞价 `/api/v1/bid` | ❌ | 媒体在**同步等**中标广告(200ms 内返回)，不能排队待会儿处理 |
 
 所以高并发下 MQ 帮 SSP 把**竞价的副产品(日志/埋点/计费)**异步化削峰、保护 DB；**竞价主链路的延迟**仍靠线程池/缓存/限流/多实例水平扩容来扛。
+
+---
+
+## 33. 用户频次控制（Frequency Cap）
+
+### 频次控制 ≠ QPS 限流（两条轴，别混）
+
+| | QPS 限流(第 20 节) | 频次控制(本节) |
+|---|---|---|
+| 限制对象 | **每个 DSP**:每秒接几个请求 | **每个用户**:某 DSP 广告每天看几次 |
+| 目的 | 保护 DSP 别被压垮 | 保护用户体验,别让广告刷屏 |
+| 维度 | per-DSP / per-second | per-(user,dsp) / per-day |
+| key | `ssp:rate:{dspId}:{秒}` | `ssp:freq:{userId}:{dspId}:{日}` |
+
+两者都是 Redis 固定窗口,只是粒度从「秒」变「天」——进入新的一天 key 变了自动清零。
+
+### 两个动作分两个时机：检查 vs 计数
+
+```
+检查(isCapped)：竞价时——筛掉该用户今日看够的 DSP，不让它参与
+计数(increment)：曝光埋点时——用户真看到了，对(user,dsp)今日 +1
+```
+
+**计数放曝光而非中标**:频次 = 真正「看到」的次数,所以在 impression 回调里 +1,不是竞价返回时。
+
+### 整体流程（两个时机靠 Redis 计数器串起来）
+
+**流程一 · 竞价时——检查 + 把 userId 带下去**
+
+```
+媒体发 BidRequest(带 user.userId)
+  → BidService 查到关联 DSP 列表 [dsp-001, dsp-002, dsp-003]
+  → 【检查】对每个 DSP 调 isCapped(userId, dspId, cap)
+        读 Redis: GET ssp:freq:{userId}:{dspId}:{今天}，计数 ≥ cap 的被剔除
+  → 用"没看够"的 DSP 竞价 → 选 winner
+  → buildBidResponse 把 userId 塞进 BidResponse
+  → saveBidResult: BidResponse(含 userId、winDsp)缓存进 Redis ssp:bid_result:{rid}
+  → 返回广告
+```
+
+**流程二 · 曝光时——计数**
+
+```
+用户真看到广告 → GET /track/impression?rid={rid}
+  → TrackService 从 Redis 取 ssp:bid_result:{rid} → 拿到 userId + winDsp
+  → 写 event_log
+  → 【计数】increment(userId, winDsp): INCR ssp:freq:{userId}:{winDsp}:{今天}(首次设 TTL)
+```
+
+**闭环**
+
+```
+第 1~3 次看 dsp-002 广告 → 每次曝光 INCR → 计数 1→2→3
+第 4 次竞价 → isCapped 读到 3 ≥ cap → dsp-002 被剔除，不再投给该用户
+进入新的一天 → key 里日期变 → 计数从 0 重新开始
+```
+
+一句话:**看一次记一笔(曝光计数),竞价前查账本(检查),看够了就不再投,每天账本翻新页(按天 key)。**
+
+| 角色 | 职责 |
+|------|------|
+| `FrequencyCapService` | 管 Redis 账本:`isCapped` 查、`increment` 记 |
+| `BidService` | 竞价前查账本剔除看够的 DSP;把 userId 寄存进结果 |
+| `TrackService` | 曝光时记账 |
+| `BidResponse.userId` | 把"是谁"从竞价时带到曝光时的载体 |
+
+### 为什么 BidResponse 要加 userId
+
+曝光回调只带 `requestId`,要知道「是哪个用户看的」才能计数。所以竞价时把 `userId` 一起塞进缓存的 `BidResponse`(Redis `ssp:bid_result:{rid}`),曝光时取出来用。
+
+### 为什么用 StringRedisTemplate
+
+计数器是纯数字。项目主 `RedisTemplate` 配的是 JSON 序列化器(给对象用),拿来做 `INCR`/`GET` 数字会有类型转换的别扭。Spring Boot 自动配了 `StringRedisTemplate`(key/value 都纯字符串),`INCR` 返回 Long、`GET` 返回可直接 `Long.parseLong` 的字符串,最干净。
+
+### 边界
+
+- **匿名用户**(无 userId):没法追踪 → 跳过频控,正常参与竞价。
+- 所有关联 DSP 都被 cap → 该次竞价 no fill。
+- cap 配置 `ssp.freq.daily-cap`(0=不限);进阶可做成每 DSP 不同(放 dsp_config)。
+
+---
+
+## 34. bid_log 落库策略开关（direct / kafka）+ 写入压测
+
+### 用策略模式给"怎么落库"加开关
+
+第 32 节把 bid_log 改成只走 Kafka，带来一个副作用：**不开 Docker/Kafka 就没法正常用**。于是再加一层策略，按 `ssp.bid-log.mode` 切换：
+
+```
+BidLogWriter(接口)  void write(List<BidLog>)
+ ├─ DirectBidLogWriter   @ConditionalOnProperty(havingValue="direct", matchIfMissing=true)  同步单条 insert
+ └─ KafkaBidLogWriter    @ConditionalOnProperty(havingValue="kafka")                          发 Kafka
+```
+
+- BidService 算完竞价 → 拼好 `List<BidLog>` → `bidLogWriter.write(list)`，不关心底层。第三个策略模式了（前两个：DspCaller、PricingStrategy）。
+- **关键：Kafka 那条链路要整条开关**——`KafkaBidLogWriter`(生产者)和 `BidLogConsumer`(消费者)都加 `havingValue="kafka"`。这样 direct 模式下消费者不注册 → 不连 Kafka → 不刷连接日志。
+- 默认 `direct`：开箱即用、无需 Docker；想练 Kafka 时 `--ssp.bid-log.mode=kafka`。
+
+### 写入压测：单条 vs 批量（BidLogInsertBenchmarkTest）
+
+造 N 条 BidLog，分别给「循环单条 insert」和「一次 insertBatch」计时（不开事务，真实 commit）：
+
+| N | 单条(ms) | 批量(ms) | 提速 |
+|---|---------|---------|------|
+| 100 | 90 | 12 | 7.5x |
+| 500 | 283 | 27 | 10.5x |
+| 1000 | 276 | 34 | 8.1x |
+
+**批量快约 7~10 倍，且 N 越大优势越明显。**
+
+为什么：
+
+| | 单条 × N | insertBatch(N) |
+|---|---------|----------------|
+| 网络往返 | **N 次** | **1 次** |
+| SQL | N 条独立语句 | 1 条多 VALUES |
+| 随 N 增长 | 线性涨 | 几乎不涨(12→34ms) |
+
+瓶颈在**网络往返次数**：单条写每条都要和 MySQL 一来一回，批量把 N 次往返压成 1 次。这也印证了 Kafka 方案的价值——消费者攒一批 `insertBatch`，享受的就是这倍数的提速。
+
+> 基准测试要点：不开 `@Transactional`(要真实 commit)；先预热一轮避开 JIT/连接池冷启动；造的数据用 `request_id` 前缀标记、跑完清理；手动跑 `-Dtest=BidLogInsertBenchmarkTest`。本地数字有噪声，看量级和趋势即可。
+
+### 两种模式怎么选
+
+| | direct | kafka |
+|---|--------|-------|
+| 依赖 | 仅 MySQL | + Kafka(Docker) |
+| 写入 | 同步逐条，占竞价线程 | 异步批量，不占竞价线程 |
+| 适合 | 本地/小流量/图省事 | 高并发/解耦/接近真实 |

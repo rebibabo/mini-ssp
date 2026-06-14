@@ -39,11 +39,15 @@ mybatis-plus:
     log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
 
 ssp:
+  bid-log:
+    mode: direct                            # bid_log 落库方式：direct=同步直写MySQL(默认,无需Kafka) | kafka=发Kafka消费者批量入库
   kafka:
-    bid-log-topic: bid-log                  # bid_log 消息的 topic 名
+    bid-log-topic: bid-log                  # bid_log 消息的 topic 名(仅 kafka 模式用)
   dsp:
     # DSP 调用模式：mock=进程内模拟(默认,无需启动DSP服务) | http=WebClient 真实调用 8081-8083 的 Mock DSP
     mode: mock
+  freq:
+    daily-cap: 3                            # 同一用户对同一 DSP 广告每天最多展示次数(0=不限)
   bid:
     global-timeout-ms: 200
     default-dsp-timeout-ms: 150

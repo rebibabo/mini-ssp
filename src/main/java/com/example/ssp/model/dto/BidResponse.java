@@ -13,6 +13,9 @@ public class BidResponse {
     // 广告位 ID
     private String adSlotId;
 
+    // 用户 ID：随竞价结果缓存进 Redis，曝光埋点时用于频次计数(匿名用户为 null)
+    private String userId;
+
     // 中标 DSP 名称
     private String winDsp;
 

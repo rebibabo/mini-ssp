@@ -1,5 +1,6 @@
 package com.example.ssp.service;
 
+import com.example.ssp.cache.FrequencyCapService;
 import com.example.ssp.cache.RateLimiter;
 import com.example.ssp.cache.SlotCacheService;
 import com.example.ssp.model.dto.BidRequest;
@@ -8,8 +9,8 @@ import com.example.ssp.model.dto.DeviceDTO;
 import com.example.ssp.model.dto.DspBidRequest;
 import com.example.ssp.model.dto.DspBidResponse;
 import com.example.ssp.model.entity.AdSlot;
-import com.example.ssp.model.entity.BidLog;
 import com.example.ssp.model.entity.DspConfig;
+import com.example.ssp.service.bidlog.BidLogWriter;
 import com.example.ssp.service.dsp.DspCaller;
 import com.example.ssp.service.pricing.FirstPricePricing;
 import org.junit.jupiter.api.BeforeEach;
@@ -17,7 +18,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
-import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.math.BigDecimal;
@@ -45,11 +45,13 @@ class BidServiceTest {
     @Mock
     private TrackService trackService;
     @Mock
-    private KafkaTemplate<String, BidLog> kafkaTemplate;
+    private BidLogWriter bidLogWriter;
     @Mock
     private DspCaller dspCaller;
     @Mock
     private RateLimiter rateLimiter;
+    @Mock
+    private FrequencyCapService frequencyCapService;
 
     private BidService bidService;
 
@@ -57,8 +59,8 @@ class BidServiceTest {
     void setUp() {
         // bidExecutor 用同步执行器：supplyAsync 立即在当前线程执行，futures 直接完成
         // 现有用例断言的是一价行为(winPrice==最高出价)，传入 FirstPricePricing
-        bidService = new BidService(slotCacheService, trackService, kafkaTemplate,
-                dspCaller, rateLimiter, new FirstPricePricing(), Runnable::run);
+        bidService = new BidService(slotCacheService, trackService, bidLogWriter,
+                dspCaller, rateLimiter, frequencyCapService, new FirstPricePricing(), Runnable::run);
         // 单元测试没有开spring容器，所以@Value 字段不会根据yml配置文件注入
         // 手动设置，这是springboot把反射包装成测试好用的工具
         // bidService.globalTimeoutMs=200

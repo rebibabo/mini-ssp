@@ -4,6 +4,7 @@ import com.example.ssp.mapper.BidLogMapper;
 import com.example.ssp.model.entity.BidLog;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
 
@@ -22,6 +23,7 @@ import java.util.List;
 @Slf4j
 @Component
 @RequiredArgsConstructor
+@ConditionalOnProperty(name = "ssp.bid-log.mode", havingValue = "kafka")  // 仅 kafka 模式启用，direct 模式下不连 Kafka
 public class BidLogConsumer {
 
     private final BidLogMapper bidLogMapper;

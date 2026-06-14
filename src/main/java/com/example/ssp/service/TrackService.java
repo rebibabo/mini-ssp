@@ -1,5 +1,6 @@
 package com.example.ssp.service;
 
+import com.example.ssp.cache.FrequencyCapService;
 import com.example.ssp.mapper.EventLogMapper;
 import com.example.ssp.model.dto.BidResponse;
 import com.example.ssp.model.entity.EventLog;
@@ -19,6 +20,7 @@ public class TrackService {
 
     private final EventLogMapper eventLogMapper;
     private final RedisTemplate<String, Object> redisTemplate;
+    private final FrequencyCapService frequencyCapService;
 
     private static final String KEY_BID_RESULT = "ssp:bid_result:";
 
@@ -52,6 +54,13 @@ public class TrackService {
 
         // 写曝光记录
         saveEventLog(bidResponse, EVENT_IMPRESSION, ip, ua);
+
+        // 频次计数：用户真正看到广告了，对(用户,中标DSP)今日 +1（匿名用户跳过）
+        String userId = bidResponse.getUserId();
+        if (userId != null && !userId.isBlank()) {
+            frequencyCapService.increment(userId, bidResponse.getWinDsp());
+        }
+
         log.info("[Track] impression recorded, requestId={}, dsp={}", requestId, bidResponse.getWinDsp());
 
         return bidResponse.getAdContent().getClickUrl();
