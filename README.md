@@ -37,7 +37,7 @@
 |------|------|
 | `src/` | Mini-SSP 主服务(端口 8080) |
 | `mock-dsp/` | 独立的 Mock DSP 服务,一份代码用 profile `dsp-a/b/c` 起 3 实例(8081/8082/8083),模拟出价/延迟/超时异常 |
-| `docker/` | 单节点 Kafka 的 docker-compose |
+| `docker/` | Kafka + Prometheus + Grafana 的 docker-compose(`docker/kafka/`) |
 | `scripts/` | `test-modeB.sh` 端到端联调自动化脚本 |
 
 ## 快速开始
@@ -131,6 +131,27 @@ cd mock-dsp
 
 - 单元测试:`BidServiceTest`(竞价决策)、`PricingStrategyTest`(一价/二价)、`RateLimiterTest`(限流)
 - 集成测试:`*ControllerTest`(需 MySQL + Redis)
+
+## 可观测性:Metrics(Prometheus + Grafana)
+
+通过 Micrometer 暴露 `/actuator/prometheus`,埋点覆盖竞价 QPS、各 DSP 出价结果(win/lose/no_bid/error/rate_limited/timeout)、DSP 调用耗时、整体竞价耗时。
+
+```bash
+cd docker/kafka && docker compose up -d prometheus grafana
+```
+
+- Prometheus UI: http://localhost:9090 (Targets 页确认 `mini-ssp` job 为 `UP`,前提 SSP 在宿主机 8080 跑着)
+- Grafana: http://localhost:3000 (admin/admin),数据源 Prometheus 填 `http://prometheus:9090`
+
+常用 PromQL:
+
+```promql
+# fill QPS
+sum(rate(ssp_bid_requests_total{result="fill"}[1m])) by (result)
+
+# No Fill 率(0~1,面板 Unit 设为 Percent 0.0-1.0)
+sum(rate(ssp_bid_requests_total{result="no_fill"}[1m])) / sum(rate(ssp_bid_requests_total[1m]))
+```
 
 ## 设计要点
 
