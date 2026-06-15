@@ -7,6 +7,7 @@
 | ✅ | Phase 1-5 | 核心骨架 / 竞价链路 / 缓存限流 / 埋点 + AOP 等(已完成) |
 | ✅ | Phase 6 | 真实 Mock DSP 服务 + WebClient(本次完成,见下方 2026-06-14) |
 | 🔶 | Phase 7 | 单元测试(部分完成) |
+| 🔶 | Phase 10 | Metrics：埋点 + Prometheus/Grafana 已跑通，大盘面板还在加(见第 35 节) |
 
 ### 2026-06-14 — Phase 6：真实 Mock DSP + WebClient（Mode B）
 
@@ -1866,3 +1867,144 @@ BidLogWriter(接口)  void write(List<BidLog>)
 | 依赖 | 仅 MySQL | + Kafka(Docker) |
 | 写入 | 同步逐条，占竞价线程 | 异步批量，不占竞价线程 |
 | 适合 | 本地/小流量/图省事 | 高并发/解耦/接近真实 |
+
+---
+
+## 35. Metrics：Micrometer 埋点（Phase 10 第一步）
+
+### 整体链路
+
+```
+代码里打点 (Micrometer)  →  /actuator/prometheus 端点  →  Prometheus(拉取+存储)  →  Grafana(画图)
+```
+
+- **Micrometer** 是 metrics 的"门面"（类比 SLF4J）：业务代码只调用 Micrometer 的 API，底层后端(Prometheus/Datadog/...)可换不改代码。
+- **MeterRegistry**：Spring Boot 自动注册的"总注册表"，所有指标汇总到这里，由 Actuator 暴露成 Prometheus 文本格式。
+- **Prometheus 是拉模式**：应用暴露快照端点，Prometheus 按间隔主动来抓，每次抓到的值带时间戳存成时间序列。Counter 是"累加值"，画图时用 `rate()` 算每秒增长率才是 QPS。
+- **Grafana** 不存数据，连 Prometheus 当数据源，用 PromQL 查询画图拼 Dashboard。
+
+### 四种指标类型
+
+| 类型 | 含义 | 本项目例子 |
+|---|---|---|
+| Counter | 只增不减 | 竞价请求数、各 DSP 出价结果数 |
+| Timer | 耗时分布(次数+总耗时+分位数) | 竞价总耗时、单个 DSP 调用耗时 |
+| Gauge | 瞬时值，可增可减 | (未用)线程池队列长度等 |
+| DistributionSummary | 数值分布(非时间) | (未用)中标价格分布 |
+
+### Tag(标签)：让一个指标能分组
+
+`meterRegistry.counter("ssp_bid_requests_total", "result", "fill")` 中：
+- `"ssp_bid_requests_total"` 是指标名
+- `"result"` 是 tag **key**（类似数据库的列名/分组维度）
+- `"fill"` 是 tag **value**（这一维度下的具体取值）
+
+`result=fill` 和 `result=no_fill` 是同一指标名下两条**独立的时间序列**，Prometheus/Grafana 可以按 `result` 分组、算占比(如 no_fill 率 = no_fill/(fill+no_fill))。
+
+`meterRegistry.counter(name, tags...)`/`meterRegistry.timer(name, tags...)` 内部按 `(name + tags 组合)` 做 key 查找/创建——**相同组合复用同一个 Counter/Timer 实例**（这也是测试里能直接读到业务代码 increment 过的值的原因），不同组合各自独立计数。
+
+### 落地步骤 1：依赖 + 端点
+
+- `pom.xml` 加 `spring-boot-starter-actuator` + `micrometer-registry-prometheus`
+- `application.yml` 加：
+  ```yaml
+  management:
+    endpoints:
+      web:
+        exposure:
+          include: health,prometheus
+  ```
+- 验证：`curl localhost:8080/actuator/prometheus` 能看到 JVM/HikariCP/磁盘等框架自带指标（零代码）。
+
+### 落地步骤 2：BidService 埋点
+
+`BidService` 新增 `MeterRegistry meterRegistry` 依赖（第 9 个，`@RequiredArgsConstructor` 自动处理）。
+
+**1) `ssp_bid_requests_total`（Counter，tag: result=fill/no_fill）**
+
+`processBid()` 的 4 个出口（无关联DSP / 全部被频控 / 无赢家 / 正常返回）各打一次，`result` 取 `fill` 或 `no_fill`。
+
+**2) `ssp_dsp_bid_total`（Counter，tag: dsp_id, result）**
+
+`result` 取值映射自 `bid_log.status` + 是否中标：
+
+| bid_log status | isWinner | result |
+|---|---|---|
+| 1(有效出价) | true | win |
+| 1(有效出价) | false | lose |
+| 2(无出价/低于底价) | - | no_bid |
+| 3(异常) | - | error |
+| 4(限流) | - | rate_limited |
+
+在 `writeBidLogs()` 循环里，每条 bidLog 构造完后调用 `dspResultTag(status, isWinner)` 算出 `result`，打一次计数。
+
+**timeout 单独处理**：超时的 DSP 不会进入 `writeBidLogs()` 遍历的 `allResults`（`processBid()` 步骤5会把未 `isDone()` 的 future 直接丢弃）。`futures` 和 `dsps` 是同一个 for 循环按下标一一对应生成的，所以在 `allOf.get()` 超时的 `catch` 块里，遍历下标找出 `!futures.get(i).isDone()` 的，按 `dsps.get(i).getDspId()` 打 `result=timeout`。
+
+**3) `ssp_dsp_call_duration_seconds`（Timer，tag: dsp_id）**
+
+`callDsp()` 里本来就在算 `elapsedMs`(写进 bid_log 用)，success/error 两个分支直接 `meterRegistry.timer(...).record(Duration.ofMillis(elapsedMs))`，复用现成的耗时数据。
+
+**4) `ssp_bid_duration_seconds`（Timer，整次竞价耗时）**
+
+`processBid()` 有 4 个 return，不能在某一行算耗时。用 `Timer.Sample sample = Timer.start(meterRegistry)` 包住整个方法体（`try/finally`），`finally` 里 `sample.stop(meterRegistry.timer("ssp_bid_duration_seconds"))`——不管从哪个 return 出去都会记录，4 个 return 一行不用改。
+
+### 测试
+
+`BidServiceTest` 用 `SimpleMeterRegistry`（内存实现，无需 mock）：
+- `setUp()` 里 `meterRegistry = new SimpleMeterRegistry()`，传给 `new BidService(...)`
+- 验证 fill/no_fill、win/lose/no_bid 计数：直接 `meterRegistry.counter(name, tags...).count()` 断言
+- 验证 timeout：用真实线程池(`Executors.newFixedThreadPool`) + `globalTimeoutMs=100` + 让一个 DSP `Thread.sleep(300)` 制造真实超时，断言 `result=timeout` 计数为 1
+
+### Prometheus + Grafana 容器
+
+在 `docker/kafka/docker-compose.yml`（与现有 kafka 服务同一个 compose 文件）里新增两个服务：
+
+```yaml
+prometheus:
+  image: prom/prometheus:v2.55.1
+  container_name: mini-ssp-prometheus
+  ports:
+    - "9090:9090"          # http://localhost:9090
+  volumes:
+    - ../prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+grafana:
+  image: grafana/grafana:11.4.0
+  container_name: mini-ssp-grafana
+  ports:
+    - "3000:3000"          # http://localhost:3000，admin/admin
+  environment:
+    GF_SECURITY_ADMIN_PASSWORD: admin
+```
+
+新建 `docker/prometheus/prometheus.yml`：
+
+```yaml
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: 'mini-ssp'
+    metrics_path: '/actuator/prometheus'
+    static_configs:
+      - targets: ['host.docker.internal:8080']   # Docker Desktop 访问宿主机的特殊地址
+```
+
+启动：`cd docker/kafka && docker compose up -d prometheus grafana`。验证抓取成功：`http://localhost:9090/targets` 里 `mini-ssp` job 应为 `UP`（前提是 SSP 应用在宿主机 8080 跑着）。
+
+**Grafana 接入 Prometheus**：UI 登录后 Connections → Data sources → Add → Prometheus，URL 填 `http://prometheus:9090`（容器间用 compose service 名互相访问，不是 `localhost`）。
+
+### 第一张大盘：竞价大盘
+
+新建 Dashboard，加面板（查询框切到 Code 模式输入 PromQL）：
+
+1. **fill QPS**：`sum(rate(ssp_bid_requests_total{result="fill"}[1m])) by (result)`
+   - `rate()` = Counter 在时间窗口内的"每秒平均增量"，单位是次/秒，不是占比，可以 >1。
+2. **No Fill 率**：`sum(rate(ssp_bid_requests_total{result="no_fill"}[1m])) / sum(rate(ssp_bid_requests_total[1m]))`
+   - 这才是 0~1 的占比，面板 Unit 设成 `Percent (0.0-1.0)`。
+
+验证用的测试请求：`slot-test-001`(有 DSP，能 fill) 和 `slot-no-dsp`(无关联 DSP，必 no_fill)，循环 `curl POST /api/v1/bid` 制造持续流量。
+
+### 下一步(未做)
+
+继续加面板：各DSP中标率(`ssp_dsp_bid_total` 的 win/lose/no_bid/timeout 等 tag)、DSP调用耗时P99(`ssp_dsp_call_duration_seconds`)。

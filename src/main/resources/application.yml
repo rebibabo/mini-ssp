@@ -1,6 +1,13 @@
 server:
   port: 8080
 
+management:
+  endpoints:
+    web:
+      exposure:
+        # 默认只开 health，这里额外开放 prometheus 抓取端点
+        include: health,prometheus
+
 spring:
   application:
     name: mini-ssp

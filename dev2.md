@@ -517,3 +517,71 @@ void shouldUseFloorPricePlusOne_whenOnlyOneValidBid() {
 - Phase 8 的 Pub/Sub 涉及多实例场景，单机验证价值有限，可以放最后
 
 完成 Phase 6-9 后，Mini-SSP 已经覆盖：完整业务链路、真实网络调用、缓存策略、限流、异步处理、容器化、单元测试——足以作为一个完整的后端项目在面试中展示。
+
+---
+
+# Phase 6-9 完成情况（2026-06-14 更新）
+
+| Phase | 内容 | 状态 | 说明 |
+|-------|------|------|------|
+| 6 | 真实 Mock DSP + WebClient | ✅ 完成 | 独立 mock-dsp(profile 起3实例) + DspCaller 策略(mock/http 切换) |
+| 7 | 单元/集成测试 | ✅ 完成 | BidServiceTest / PricingStrategyTest / FrequencyCapServiceTest / RateLimiterTest + Controller 集成测试 |
+| 7 | Docker 化 | 🔶 部分 | 只 docker 化了 Kafka(docker/docker-compose.yml)，整套(MySQL+Redis+DSP+SSP)一键拉起未做 |
+| 8 | 配置热更新(Redis Pub/Sub) | ⬜ 未做 | 见下方第一梯队，注意前提：缓存要开着才有意义 |
+| 8 | 接口级限流(令牌桶) | ⬜ 未做 | DSP 级 QPS 限流已做；全局 /bid 限流未做 |
+| 9 | 二价拍卖 | ✅ 完成 | PricingStrategy 策略(first/second)，成交价持久化到 bid_log.win_price |
+| 9 | 异步批量写 bid_log | ✅ 完成(走 Kafka) | 没用 BlockingQueue，改用 Kafka 生产者+消费者批量入库；并加了 direct/kafka 开关 + 写入压测 |
+
+额外完成(原计划外)：频次控制、Swagger 文档、敏感配置 .env 治理、GitHub 仓库 + README、Mode B 联调自动化脚本。
+
+---
+
+# Phase 10+：后续增强方向（2026-06-14 规划）
+
+> 现状：广度已经很够（竞价/缓存/限流/埋点/MQ/Swagger/测试/容错/二价/频控…）。
+> **meta 建议：该往"深"走，别再贪"广"**——挑一个做到端到端能看见的程度（如 Metrics 一路做到 Grafana 大盘、截图进简历），比再横向接一个框架更有说服力。
+
+## 第一梯队（面试/实战高频，缺了明显）
+
+### 10.1 可观测性：Metrics + Grafana 大盘（首选）
+
+- 接入 Micrometer + Prometheus，暴露广告系统核心指标：竞价 QPS、各 DSP 中标率、P99 延迟、超时率、no fill 率。
+- 价值：① 面试硬通货；② 把已理解的机制（status=3 超时、截止时间丢弃慢 DSP）**可视化量化**；③ 激活 Kafka 那节"加实时大盘消费者"的伏笔。
+- 注意：Micrometer/Prometheus 是**标准做法**；notes 里设想的"Kafka 聚合消费者算实时统计"是自己造轮子那条路，可作为 fan-out 练习补充，别重复造。
+- 做透目标：Micrometer 埋点 → Prometheus 抓取 → Grafana 真做出一个竞价大盘。
+
+### 10.2 链路追踪：TraceId（MDC + SLF4J）
+
+- 已有 requestId 贯穿全链路，再用 MDC 让日志自动带上 traceId，排障更顺。成本最低、可顺手做，不必单列大项。
+
+## 第二梯队（让项目更"真"）
+
+### 10.3 熔断降级（Resilience4j）—— 最"对题"，建议提前
+
+- 某 DSP 持续超时/报错时自动熔断一段时间，不再无谓调用。是容错主线（超时=这次放弃 → 熔断=最近老坏先停一段）的自然升华。
+- 现成试验台：mock DSP-C 本就模拟超时/异常。
+- 比 JWT 更能体现 SSP 专业度，优先级建议高于 10.4。
+
+### 10.4 JWT 认证授权
+
+- 管理后台接口目前裸奔，加认证授权让项目完整。但偏"通用 web 技能"、非广告域，优先级放在 Metrics/熔断之后。
+
+### 10.5 配置热更新（Redis Pub/Sub）
+
+- 改 DSP/广告位配置主动失效缓存，不等 TTL。**前提：缓存要常态开启**（当前 ssp.cache.enabled 默认 false，缓存不开就没这个痛点，先确认再做）。
+
+## 第三梯队（锦上添花，不急）
+
+### 10.6 整体竞价链路压测报告
+
+- 已做缓存压测、写入压测；再做一次整体竞价链路压测（不同 QPS 下 P99、错误率），整理成性能报告，面试用数据说话。
+
+### 10.7 整套 Docker 化
+
+- docker-compose 一键拉起 MySQL + Redis + Kafka + 3×mock-dsp + SSP。
+
+## 推荐推进顺序
+
+**Metrics（做到 Grafana）→ TraceId（顺手）→ 熔断降级 → 其余按需**
+
+理由：先把可观测性做透（最高杠杆 + 可视化已有成果），TraceId 顺带做，再补熔断（容错主线升华、有现成试验台）；JWT/热更新/压测报告/全套 Docker 视精力按需取。
