@@ -7,6 +7,19 @@ management:
       exposure:
         # 默认只开 health，这里额外开放 prometheus 抓取端点
         include: health,prometheus
+  metrics:
+    distribution:
+      # 开启 histogram bucket，让 Prometheus 可以用 histogram_quantile() 算 P99
+      percentiles-histogram:
+        ssp_dsp_call_duration_seconds: true
+        ssp_bid_duration_seconds: true
+      # 限制 bucket 范围，避免生成无意义的极端 bucket（广告调用一般在 1ms~500ms 之间）
+      minimum-expected-value:
+        ssp_dsp_call_duration_seconds: 1ms
+        ssp_bid_duration_seconds: 1ms
+      maximum-expected-value:
+        ssp_dsp_call_duration_seconds: 500ms
+        ssp_bid_duration_seconds: 500ms
 
 spring:
   application:
