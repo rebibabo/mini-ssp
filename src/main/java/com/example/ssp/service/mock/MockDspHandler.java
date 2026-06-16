@@ -2,7 +2,9 @@ package com.example.ssp.service.mock;
 
 import com.example.ssp.model.dto.DspBidRequest;
 import com.example.ssp.model.dto.DspBidResponse;
+import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
@@ -12,12 +14,35 @@ import java.util.Random;
 /**
  * 进程内 Mock DSP，模拟真实 DSP 的竞价行为。
  * 不发真实 HTTP 请求，直接在内存中返回结果，用于开发和测试阶段。
+ *
+ * 两个压测专用配置（不影响正常开发，默认行为不变）：
+ *   ssp.dsp.mock-random-seed  : 固定随机种子，让每次跑的出价/no_bid 序列完全一样，
+ *                               消除业务随机性对压测数据的干扰。默认 -1（不固定，每次真随机）。
+ *   ssp.dsp.mock-latency-ms   : 覆盖所有 DSP 的模拟延迟，设为 0 可消除 DSP 等待时间，
+ *                               让压测结果只体现基础设施差异（cache/DB/Kafka）。默认 -1（用各 DSP 原始配置）。
  */
 @Slf4j
 @Component
 public class MockDspHandler {
 
-    private final Random random = new Random();
+    // 固定种子：-1 = 不固定（每次真随机）；其他值 = 固定种子，压测时用
+    @Value("${ssp.dsp.mock-random-seed:-1}")
+    private long randomSeed;
+
+    // 延迟覆盖：-1 = 用各 DSP 原始配置；0 = 无延迟（纯测基础设施）；其他值 = 统一延迟 ms
+    @Value("${ssp.dsp.mock-latency-ms:-1}")
+    private int mockLatencyMs;
+
+    // Random 在 @PostConstruct 里初始化，因为 @Value 注入在构造函数之后才完成
+    private Random random;
+
+    @PostConstruct
+    void init() {
+        random = randomSeed < 0 ? new Random() : new Random(randomSeed);
+        log.info("[MockDSP] random seed={}, latency override={}ms",
+                randomSeed < 0 ? "random" : randomSeed,
+                mockLatencyMs < 0 ? "per-dsp" : mockLatencyMs);
+    }
 
     // 每个 DSP 的模拟出价范围（最低价, 最高价）
     private static final Map<String, int[]> DSP_BID_RANGES = Map.of(
@@ -26,7 +51,7 @@ public class MockDspHandler {
             "dsp-003", new int[]{50, 300}     // 出价 0.50 ~ 3.00 元
     );
 
-    // 每个 DSP 的模拟响应延迟（毫秒）
+    // 每个 DSP 的原始模拟响应延迟（毫秒），可被 mock-latency-ms 覆盖
     private static final Map<String, Integer> DSP_LATENCY = Map.of(
             "dsp-001", 50,
             "dsp-002", 80,
@@ -76,7 +101,9 @@ public class MockDspHandler {
     }
 
     private void simulateLatency(String dspId) {
-        int latency = DSP_LATENCY.getOrDefault(dspId, 100);
+        // mockLatencyMs >= 0 时覆盖所有 DSP 的延迟（0 = 无延迟，压测基础设施用）
+        int latency = mockLatencyMs >= 0 ? mockLatencyMs : DSP_LATENCY.getOrDefault(dspId, 100);
+        if (latency == 0) return;
         try {
             Thread.sleep(latency);
         } catch (InterruptedException e) {

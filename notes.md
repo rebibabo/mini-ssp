@@ -2141,3 +2141,181 @@ supplyAsync(() -> {
 
 当前实现是**单服务内**的日志追踪，traceId 不会随 WebClient 调用传到 DSP 服务。
 跨服务追踪需要 Micrometer Tracing + Zipkin/Jaeger，traceId 通过 HTTP header 跨服务传播——对当前单体项目意义不大，留作后续扩展方向。
+
+## 37. 压测实验：基础设施对比 + 并发扫描 + 连接池对照（Phase 12）
+
+### 压测专用配置（MockDspHandler）
+
+为了让压测结果只反映基础设施差异、排除业务随机性，给 `MockDspHandler` 加了两个开关
+（默认值保证正常开发行为不变）：
+
+| 配置 | 默认 | 作用 |
+|---|---|---|
+| `ssp.dsp.mock-random-seed` | -1（真随机） | 固定随机种子 |
+| `ssp.dsp.mock-latency-ms`  | -1（用各 DSP 原始延迟） | 覆盖所有 DSP 延迟；设 0 = 消除 DSP 等待，纯测基础设施 |
+
+**坑**：`-D` 系统属性传不进 Spring 应用，必须用
+`./mvnw spring-boot:run -Dspring-boot.run.arguments="--ssp.dsp.mock-latency-ms=0"`。
+
+**坑**：固定种子在并发压测下没用——`Random` 线程安全但多线程调用顺序不确定，
+即使固定种子，出价/no_bid 序列也无法复现。种子只在单线程下有意义。
+
+### 实验一：三层基础设施对比（latency=0，50 并发，60s）
+
+固定 latency=0 隔离基础设施差异，三组只改 cache 和 bid_log 写入方式：
+
+| 场景 | 配置 | 吞吐 req/s | P50 | P95 | P99 | max | fill |
+|---|---|---|---|---|---|---|---|
+| ① Baseline | no-cache + DB 直写 | 129.8 | 419.7 | 621.3 | 720.1 | 1025 | 99.3% |
+| ② +Redis Cache | cache + DB 直写 | 133.2 | 401.0 | 631.6 | 746.5 | 962 | 99.4% |
+| ③ Full Stack | cache + Kafka 异步 | **142.5** | 401.6 | **570.1** | **647.0** | **768** | 99.4% |
+
+**结论（和直觉不同）**：
+- ① → ②（加 Redis 缓存）**差异在噪声级**：吞吐 +3.4、P50 -19ms，但 P95/P99 反而略升。
+  原因：slot/DSP 配置表小、有索引，省下那两次 SQL 收益有限。
+- ② → ③（bid_log 改 Kafka 异步）**才是清晰赢家**：P95 -61ms、P99 -100ms。
+  把"写日志"从同步 DB insert 摘到异步 Kafka，砍掉了尾部卡在写库上的时间。
+- **真正压住尾延迟的是把写操作异步化，不是缓存读路径。**
+
+### 实验二：并发梯度扫描（② 配置，pool=10）
+
+固定 ② 配置，并发 25→400，每档 30s，找饱和点：
+
+| 并发 | 吞吐 req/s | P50 | P95 | P99 | error |
+|---|---|---|---|---|---|
+| 25  | **157.0** | 150.5 | 304.8 | 381.5 | 0% |
+| 50  | 108.2 | 448.3 | 648.6 | 861.6 | 0% |
+| 100 | 104.5 | 949.9 | 1385.6 | 1687.8 | 0% |
+| 200 | 105.1 | 1889.9 | 2661.2 | 3496.2 | 2.8% |
+| 400 | 109.5 | 2508.7 | — | — | **96.4%** |
+
+**曲线特征 = 早饱和**：吞吐在 c=25 见顶（157），之后**先掉后平**稳定在 ~105，
+延迟随并发**线性暴涨**。c=400 时延迟全顶破压测脚本 3s 超时墙 → 96% error。
+
+### 实验三：连接池对照（pool 10 vs 50）
+
+假设瓶颈是同步写 bid_log 的 HikariCP 连接池（默认 max=10）。
+只改 `--spring.datasource.hikari.maximum-pool-size=50`，其它不变，重跑扫描。
+（用 `curl /actuator/prometheus | grep hikaricp_connections_max` 确认改到了 50.0）
+
+| 并发 | 吞吐@10 | 吞吐@50 | P99@10 | P99@50 |
+|---|---|---|---|---|
+| 25  | 157.0 | 158.5 | 381 | 363 |
+| 50  | 108.2 | 116.0 | 862 | 763 |
+| 100 | 104.5 | 115.9 | 1688 | 1419 |
+| 200 | 105.1 | 114.5 | 3496 | 2784 |
+
+**结论：假设只对了一半。**
+- ✅ 连接池**确实是约束**：放大 5 倍 → 吞吐平台抬高 ~10%、P99 降 ~16%。
+- ❌ 但**不是主瓶颈**：饱和点没动（峰值还在 c=25），曲线形状不变。
+  若它是主瓶颈，5 倍连接池应让饱和点大幅右移。
+- 真正的瓶颈更深，两个嫌疑：
+  1. **DSP fan-out 线程池**（`ThreadPoolConfig`）——每次竞价并发 fan-out 给 3 个 DSP，
+     有界池直接限制"同时能跑几场竞价"。
+  2. **单机 CPU 争用**——压测客户端(Python 50~400 线程) + SSP + MySQL + Redis 全挤在
+     同一台 16GB Mac。"c=25 见顶后掉再平"这种先掉后平，是整机 CPU 争用的特征
+     （纯排队会是平的）。**测到的"饱和"有一部分是测试台子本身的极限，不全是 SSP 的。**
+
+### 坑：Docker Desktop 在这台 Mac 上反复崩
+
+跑 ③（依赖 Kafka 容器）时 Docker VM 反复挂（UI 活着、daemon socket 没了）：
+
+| Docker 内存 | 结果 | 原因 |
+|---|---|---|
+| 3GB | 压测时崩 | VM 内部扛不住 latency=0 的负载 → VM 内 OOM |
+| 7GB | 空转也崩 | 16GB Mac 给 Docker 7GB，本机不够 → macOS 杀 VM |
+| 5GB | 空转仍崩（free 还有 80%） | 与内存无关，纯 Docker Desktop 稳定性问题 |
+
+**关键发现**：Redis 和 MySQL 都是 **host 原生(brew)**，从没崩过；只有 Kafka/Prometheus/Grafana
+在 Docker 里。所以并发扫描（找 SSP 饱和点，不需要 Kafka）改用 ② 配置，绕开 Docker，全程稳定。
+教训：**实验依赖的基础设施越少越稳**，能用 host 原生就别塞进不稳定的 Docker。
+
+---
+
+## 38. 工程收尾：一键启动 + ThreadPoolConfig 分析（Phase 13）
+
+### Docker Compose 重构
+
+**目标**：MySQL/Redis 保留 brew（不丢数据），Docker 只管 Kafka 和监控，用 profiles 按需开关。
+
+**文件结构**：
+```
+mini-ssp/
+├── start.sh                        # 入口：brew + Docker + Java app
+└── docker/
+    └── docker-compose.yml          # profiles: kafka / metrics
+```
+
+**核心：Docker Compose profiles**
+
+给 service 加 `profiles: [名字]` 后，该 service **默认不启动**，只有命令行传 `--profile 名字` 才激活：
+
+```yaml
+services:
+  kafka:
+    profiles: [kafka]      # docker compose up 时跳过
+    ...
+  prometheus:
+    profiles: [metrics]
+  grafana:
+    profiles: [metrics]    # 同标签的两个 service 一起激活
+```
+
+```bash
+docker compose --profile kafka up -d            # 只起 Kafka
+docker compose --profile kafka --profile metrics up -d  # 全起
+```
+
+`start.sh` 把用户的 `--kafka / --metrics` 参数动态拼成 `--profile` 传给 compose。
+
+**各服务启动方式对比**：
+
+| 服务 | 方式 | 理由 |
+|---|---|---|
+| MySQL / Redis | brew 原生 | 已有数据，稳定，不想迁移 |
+| Kafka | Docker + profile | 按需，不用就不起 |
+| Prometheus / Grafana | Docker + profile | 按需 |
+| Java 应用 | `./mvnw spring-boot:run` | 本机有 Java，最简单，改代码立即生效 |
+
+**Dockerfile 的定位**：只在"部署到服务器/给别人用"时才有价值（对方不需要装 Java）。
+本地开发直接 mvnw 跑，Dockerfile 备用。
+
+---
+
+### ThreadPoolConfig 分析
+
+```java
+// core=8, max=16, queue=200, CallerRunsPolicy
+// 每次 bid 请求 → 提交 3 个 DSP 任务 → allOf().get() 阻塞等待
+```
+
+**两种场景下的瓶颈角色不同**：
+
+| 场景 | 线程池角色 | 原因 |
+|---|---|---|
+| latency=0（压测用） | 不是瓶颈 | 任务瞬间完成，线程池基本空转 |
+| 真实 DSP 延迟 ~100ms | **是瓶颈**，上限 ~53 req/s | 16线程 × (1000ms/100ms) / 3 DSPs |
+
+**CallerRunsPolicy 的副作用**：queue(200) 满时（c > 72），提交任务的 Tomcat 线程**自己跑 DSP 任务**，
+既要等 allOf()，又要亲自执行，等于强制背压——新请求进不来，天然限速。这是设计意图，不是 Bug。
+
+**生产建议**：`maxSize` 应按 `目标并发 × DSP数` 计算（c=50 至少需要 150）；
+或 Java 21 Virtual Threads 直接绕开有界线程池的限制。
+
+---
+
+### 项目总结
+
+**从零做完了一个完整的 mini-SSP**，覆盖：
+
+| 模块 | 关键点 |
+|---|---|
+| 核心竞价流程 | BidController → BidService → CompletableFuture 并发扇出 → 选胜者 |
+| 缓存 | Redis TTL，slot/DSP 配置缓存，bid_result 缓存 |
+| 限频 | Redis INCR QPS 限制 + 日频次上限 |
+| 异步日志 | Kafka 生产/消费 bid_log，批量入库 |
+| 追踪回调 | impression/click tracking，302 重定向 |
+| 监控 | Prometheus histogram + Grafana 看板 |
+| 链路追踪 | MDC + TraceId Filter |
+| 压测分析 | 三场景对比、并发扫描（饱和点 c=25）、连接池对照实验 |
+| 工程化 | Docker Compose profiles、start.sh 一键启动、8080 端口自动清理 |
