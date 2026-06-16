@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <springProperty scope="context" name="appName" source="spring.application.name"/>
+
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <!--
+                %X{traceId} 从 MDC 取值：
+                - 有值时输出 [traceId=req-abc123]
+                - 没有值时输出空字符串（不影响非竞价链路的日志）
+            -->
+            <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} [%X{traceId}] - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+
+    <!-- 只打印项目自身的 DEBUG 日志，屏蔽框架噪音 -->
+    <logger name="com.example.ssp" level="DEBUG"/>
+</configuration>

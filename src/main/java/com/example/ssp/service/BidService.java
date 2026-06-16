@@ -23,8 +23,11 @@ import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import org.slf4j.MDC;
+
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
@@ -101,11 +104,25 @@ public class BidService {
             // 每个 DSP 在 bidExecutor 线程池里独立执行，互不阻塞
             List<CompletableFuture<DspBidResult>> futures = new ArrayList<>();
 
+            // MDC 是 ThreadLocal：每个线程有自己独立的一份，子线程创建时不会继承父线程的值。
+            // 在提交任务前，把主线程的 MDC 内容拍一张快照（普通 Map），带进 lambda 闭包。
+            Map<String, String> mdcSnapshot = MDC.getCopyOfContextMap();
+
             for (DspConfig dsp : dsps) {
                 DspBidRequest dspRequest = buildDspRequest(request, adSlot, dsp);
                 CompletableFuture<DspBidResult> future = CompletableFuture
-                        // supplyAsync：把 callDsp 任务丢进线程池异步执行，立即返回 Future
-                        .supplyAsync(() -> callDsp(dsp, dspRequest), bidExecutor)
+                        .supplyAsync(() -> {
+                            // 子线程启动时把快照恢复到自己的 MDC，
+                            // 这样子线程打的日志也会带上和主线程相同的 traceId
+                            if (mdcSnapshot != null) MDC.setContextMap(mdcSnapshot);
+                            try {
+                                return callDsp(dsp, dspRequest);
+                            } finally {
+                                // 子线程任务结束后清空 MDC。
+                                // 线程池的线程会被复用，不清的话下一个任务会带着旧的 traceId
+                                MDC.clear();
+                            }
+                        }, bidExecutor)
                         // exceptionally：callDsp 抛异常时兜底，用 error 结果代替，保证 Future 不崩
                         .exceptionally(ex -> {
                             log.error("[Bid] dsp {} error: {}", dsp.getDspId(), ex.getMessage());

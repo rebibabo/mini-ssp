@@ -8,6 +8,7 @@
 | ✅ | Phase 6 | 真实 Mock DSP 服务 + WebClient(本次完成,见下方 2026-06-14) |
 | 🔶 | Phase 7 | 单元测试(部分完成) |
 | ✅ | Phase 10 | Metrics：埋点 + Prometheus/Grafana + 竞价大盘(4面板)全部完成(见第 35 节) |
+| ✅ | Phase 11 | TraceId：MDC + Filter 日志追踪(见第 36 节) |
 
 ### 2026-06-14 — Phase 6：真实 Mock DSP + WebClient（Mode B）
 
@@ -2065,3 +2066,78 @@ Ctrl+C                                  # 停流量生成
 # kill SSP 进程
 cd docker && docker compose down        # 停容器
 ```
+
+## 36. TraceId：MDC 日志追踪（Phase 11）
+
+### 核心概念
+
+**MDC（Mapped Diagnostic Context）**：SLF4J/Logback 提供的 `ThreadLocal<Map>`，同一线程里 `put` 一次，后续所有 `log.xxx()` 自动把值插入日志，不用每次手动传参。
+
+**为什么不直接用 requestId**：
+- requestId 是竞价业务字段，只有 `/api/v1/bid` 接口有；admin/track/actuator 等接口没有业务 id，也需要能查日志
+- Filter 比 Controller 先执行，此时 JSON body 还没解析，拿不到 requestId，只能先生成 UUID 占位
+- 对竞价接口，Controller 解析完 body 后用业务 requestId 覆盖 UUID，最终 traceId == requestId，grep requestId 就能串联整条链路
+
+### 日志格式配置
+
+`logback-spring.xml` 的 pattern 里加 `%X{traceId}`，Logback 自动从 MDC 取值：
+
+```xml
+<pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} [%X{traceId}] - %msg%n</pattern>
+```
+
+有值时输出 `[trace-test-001]`，没值时输出 `[]`（不影响非竞价链路的日志）。
+
+### TraceFilter
+
+`filter/TraceFilter.java`，继承 `OncePerRequestFilter`（每个请求只执行一次）：
+
+```
+HTTP 请求进来
+  → 取 X-Request-Id header，没有则 UUID.randomUUID()
+  → MDC.put("traceId", traceId)
+  → filterChain.doFilter(...)   放行，进入 Controller
+  → finally: MDC.remove("traceId")   必须清除！线程池复用线程，不清会污染下一个请求
+```
+
+### BidController 覆盖
+
+Filter 执行时 body 还没解析，生成的是 UUID。Controller 拿到 `BidRequest` 后：
+
+```java
+MDC.put("traceId", request.getRequestId());  // 覆盖成业务 id
+```
+
+### 线程池子线程的 MDC 传递
+
+`MDC` 是 `ThreadLocal`，`bidExecutor` 线程池的子线程创建时不继承父线程的值。
+解决：提交任务前在父线程拍快照，子线程启动时恢复：
+
+```java
+Map<String, String> mdcSnapshot = MDC.getCopyOfContextMap();  // 父线程拍快照
+
+supplyAsync(() -> {
+    if (mdcSnapshot != null) MDC.setContextMap(mdcSnapshot);  // 子线程恢复
+    try {
+        return callDsp(dsp, dspRequest);
+    } finally {
+        MDC.clear();  // 子线程任务结束清空，防止线程复用时污染下一个任务
+    }
+}, bidExecutor)
+```
+
+### 效果
+
+```
+08:34:38.093 [http-nio-exec-3]  INFO  BidController    [trace-test-001] - [Bid] requestId=trace-test-001
+08:34:38.209 [pool-3-thread-1]  DEBUG MockDspHandler   [trace-test-001] - [MockDSP] dsp-001 bid 4.44
+08:34:38.239 [pool-3-thread-2]  DEBUG MockDspHandler   [trace-test-001] - [MockDSP] dsp-002 bid 5.06
+08:34:38.277 [pool-3-thread-3]  DEBUG MockDspHandler   [trace-test-001] - [MockDSP] dsp-003 bid 1.6
+```
+
+三个子线程的日志和主线程 traceId 一致，`grep "trace-test-001" ssp.log` 把整条链路全捞出来。
+
+### 与分布式追踪的区别
+
+当前实现是**单服务内**的日志追踪，traceId 不会随 WebClient 调用传到 DSP 服务。
+跨服务追踪需要 Micrometer Tracing + Zipkin/Jaeger，traceId 通过 HTTP header 跨服务传播——对当前单体项目意义不大，留作后续扩展方向。
