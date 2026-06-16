@@ -1,0 +1,6 @@
+apiVersion: 1
+providers:
+  - name: mini-ssp
+    type: file
+    options:
+      path: /etc/grafana/provisioning/dashboards   # 扫描这个目录下的所有 .json 文件

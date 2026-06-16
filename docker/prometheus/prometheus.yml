@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 5s        # 每5秒抓一次（默认15s，本地学习调短看效果更快）
+
+scrape_configs:
+  - job_name: 'mini-ssp'      # 这组抓取任务的名字，会作为标签 job="mini-ssp" 自动加到所有指标上
+    metrics_path: '/actuator/prometheus'   # 抓哪个端点（默认是 /metrics，要改成我们开的这个）
+    static_configs:
+      - targets: ['host.docker.internal:8080']   # 宿主机的 SSP（Docker Desktop 提供的特殊地址）

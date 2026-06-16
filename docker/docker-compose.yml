@@ -1,0 +1,56 @@
+# Mini-SSP 本地基础设施：Kafka + Prometheus + Grafana
+#
+# 启动：先打开 Docker Desktop，然后在本目录执行
+#   docker compose up -d
+# 查看：docker compose ps   /   docker compose logs -f kafka
+# 停止：docker compose down            （保留下次再起；加 -v 连数据一起删）
+#
+# SSP 连接地址：localhost:9092
+services:
+  kafka:
+    image: apache/kafka:3.9.0          # 官方镜像，KRaft 单节点，约 ~500MB
+    container_name: mini-ssp-kafka
+    ports:
+      - "9092:9092"                     # 宿主机(SSP)通过 localhost:9092 连接
+    environment:
+      # --- KRaft 单节点：同一进程既当 broker 又当 controller ---
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # --- 监听器 ---
+      # 空 host(:9092)= 绑定所有网卡；advertised 必须用可路由地址(localhost)，不能用 0.0.0.0
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092   # 告诉客户端用这个地址连
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      # --- 单节点必须把副本因子设为 1（默认 3，单节点起不来）---
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # --- 限制 JVM 堆，控制内存占用 ---
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms256m"
+    # 整个容器内存上限 ~1G（docker compose v2 会尊重这个限制）
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: mini-ssp-prometheus
+    ports:
+      - "9090:9090"          # 浏览器访问 Prometheus UI: http://localhost:9090
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: mini-ssp-grafana
+    ports:
+      - "3000:3000"          # 浏览器访问 Grafana: http://localhost:3000
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin   # 默认账号 admin/admin
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
