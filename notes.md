@@ -7,7 +7,7 @@
 | ✅ | Phase 1-5 | 核心骨架 / 竞价链路 / 缓存限流 / 埋点 + AOP 等(已完成) |
 | ✅ | Phase 6 | 真实 Mock DSP 服务 + WebClient(本次完成,见下方 2026-06-14) |
 | 🔶 | Phase 7 | 单元测试(部分完成) |
-| 🔶 | Phase 10 | Metrics：埋点 + Prometheus/Grafana 已跑通，大盘面板还在加(见第 35 节) |
+| ✅ | Phase 10 | Metrics：埋点 + Prometheus/Grafana + 竞价大盘(4面板)全部完成(见第 35 节) |
 
 ### 2026-06-14 — Phase 6：真实 Mock DSP + WebClient（Mode B）
 
@@ -1990,21 +1990,78 @@ scrape_configs:
       - targets: ['host.docker.internal:8080']   # Docker Desktop 访问宿主机的特殊地址
 ```
 
-启动：`cd docker/kafka && docker compose up -d prometheus grafana`。验证抓取成功：`http://localhost:9090/targets` 里 `mini-ssp` job 应为 `UP`（前提是 SSP 应用在宿主机 8080 跑着）。
+启动：`cd docker && docker compose up -d`（compose 文件已整合到 `docker/docker-compose.yml`，kafka/prometheus/grafana 三合一）。
+验证抓取：`http://localhost:9090/targets` 里 `mini-ssp` job 应为 `UP`（前提是 SSP 在宿主机 8080 跑着）。
 
-**Grafana 接入 Prometheus**：UI 登录后 Connections → Data sources → Add → Prometheus，URL 填 `http://prometheus:9090`（容器间用 compose service 名互相访问，不是 `localhost`）。
+### Grafana Provisioning（配置即代码）
 
-### 第一张大盘：竞价大盘
+不需要手动点 UI，启动时自动配好数据源和 Dashboard，配置文件在 `docker/grafana/provisioning/`：
 
-新建 Dashboard，加面板（查询框切到 Code 模式输入 PromQL）：
+```
+docker/grafana/provisioning/
+├── datasources/
+│   └── prometheus.yml   # 数据源：uid=prometheus，url=http://prometheus:9090
+└── dashboards/
+    ├── dashboards.yml   # 扫描本目录下所有 .json 文件加载为 Dashboard
+    └── mini-ssp.json    # 竞价大盘：4 个面板的 PromQL + 布局定义
+```
 
-1. **fill QPS**：`sum(rate(ssp_bid_requests_total{result="fill"}[1m])) by (result)`
-   - `rate()` = Counter 在时间窗口内的"每秒平均增量"，单位是次/秒，不是占比，可以 >1。
-2. **No Fill 率**：`sum(rate(ssp_bid_requests_total{result="no_fill"}[1m])) / sum(rate(ssp_bid_requests_total[1m]))`
-   - 这才是 0~1 的占比，面板 Unit 设成 `Percent (0.0-1.0)`。
+`docker-compose.yml` 里挂载：`./grafana/provisioning:/etc/grafana/provisioning:ro`。
 
-验证用的测试请求：`slot-test-001`(有 DSP，能 fill) 和 `slot-no-dsp`(无关联 DSP，必 no_fill)，循环 `curl POST /api/v1/bid` 制造持续流量。
+**注意**：数据源 `uid` 必须固定（填 `uid: prometheus`），否则 Grafana 每次启动随机生成，Dashboard JSON 里的引用就对不上。
 
-### 下一步(未做)
+### 竞价大盘：4 个面板
 
-继续加面板：各DSP中标率(`ssp_dsp_bid_total` 的 win/lose/no_bid/timeout 等 tag)、DSP调用耗时P99(`ssp_dsp_call_duration_seconds`)。
+| 面板 | PromQL | 单位 |
+|---|---|---|
+| 竞价 QPS | `sum(rate(ssp_bid_requests_total[1m])) by (result)` | reqps |
+| No Fill 率 | `sum(rate(...{result="no_fill"}[1m])) / sum(rate(...[1m]))` | percentunit |
+| DSP 出价结果 | `sum(rate(ssp_dsp_bid_total[1m])) by (dsp_id, result)` | reqps |
+| DSP 调用耗时 P99 | `histogram_quantile(0.99, sum(rate(ssp_dsp_call_duration_seconds_bucket[1m])) by (le, dsp_id)) * 1000` | ms |
+
+**P99 要开 histogram bucket**：Micrometer Timer 默认只输出 `_count`/`_sum`（summary 类型），`histogram_quantile()` 需要 `_bucket`，要在 `application.yml` 显式开启：
+
+```yaml
+management:
+  metrics:
+    distribution:
+      percentiles-histogram:
+        ssp_dsp_call_duration_seconds: true
+        ssp_bid_duration_seconds: true
+      minimum-expected-value:
+        ssp_dsp_call_duration_seconds: 1ms
+      maximum-expected-value:
+        ssp_dsp_call_duration_seconds: 500ms
+```
+
+### 流量生成脚本
+
+`scripts/load_gen.py`：在爆发期（10~30 req/s，ThreadPoolExecutor 并发）和冷却期（0.5~2 req/s，sleep 间隔）之间随机切换，混合 `slot-test-001`(70% fill) 和 `slot-no-dsp`(30% no_fill)，Ctrl+C 优雅停止并打印统计。
+
+```bash
+python3 -u scripts/load_gen.py
+```
+
+### 数据持久化说明
+
+- Dashboard JSON 在 Git 里 → 永久不丢
+- Prometheus 时序数据 / Grafana 密码 → 存容器内，`docker compose down` 后清空（学习项目够用，不加 volume）
+- 若需持久化，在 docker-compose.yml 加 named volume：`prometheus_data:/prometheus` 和 `grafana_data:/var/lib/grafana`
+
+### 本次新增的坑
+
+- `docker/` 目录历史上被 git 以 gitlink(submodule, mode 160000) 记录，GitHub 上显示为链接而非目录。修复：`git rm --cached docker && git add docker/`，重新以普通目录纳入追踪。
+
+### 启停顺序
+
+```bash
+# 启动
+cd docker && docker compose up -d       # Kafka + Prometheus + Grafana
+./mvnw spring-boot:run                  # SSP 应用
+python3 -u scripts/load_gen.py          # 流量生成（可选）
+
+# 停止
+Ctrl+C                                  # 停流量生成
+# kill SSP 进程
+cd docker && docker compose down        # 停容器
+```
