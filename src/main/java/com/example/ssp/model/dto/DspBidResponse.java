@@ -1,5 +1,6 @@
 package com.example.ssp.model.dto;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
 import lombok.Data;
 
 import java.math.BigDecimal;
@@ -7,7 +8,9 @@ import java.math.BigDecimal;
 @Data
 public class DspBidResponse {
 
-    // DSP 出价（CPM），为 null 或 0 表示不参与本次竞价
+    // OpenRTB 2.5: bid.price —— DSP 出价（CPM），为 null 或 0 表示不参与本次竞价。
+    // Java 内部仍叫 bidPrice（更直观），对外 JSON 用 "price" 对齐协议。
+    @JsonProperty("price")
     private BigDecimal bidPrice;
 
     public static DspBidResponse noBid() {

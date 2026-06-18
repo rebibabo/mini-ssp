@@ -1,5 +1,6 @@
 package com.example.ssp.model.dto;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
 import io.swagger.v3.oas.annotations.media.Schema;
 import lombok.Data;
 
@@ -10,7 +11,9 @@ public class DeviceDTO {
     @Schema(description = "操作系统", example = "iOS")
     private String os;
 
-    @Schema(description = "操作系统版本", example = "14")
+    // OpenRTB 2.5: device.osv —— 操作系统版本
+    @JsonProperty("osv")
+    @Schema(description = "操作系统版本（OpenRTB osv）", example = "14")
     private String osVersion;
 
     @Schema(description = "设备型号", example = "OPPO Find X7")

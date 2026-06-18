@@ -82,27 +82,32 @@ SSP（Supply-Side Platform，供给方平台）是程序化广告生态中代表
 
 媒体发送广告请求，SSP 返回中标广告。
 
-请求体：
+请求体（JSON key 对齐 OpenRTB 2.5；Java 内部字段名经 `@JsonProperty` 解耦，见 9.x）：
 
 ```json
 {
-    "requestId": "req-20260612-001",
-    "adSlotId": "slot-1001",
+    "id": "req-20260612-001",
+    "tagid": "slot-1001",
     "device": {
         "os": "Android",
-        "osVersion": "14",
+        "osv": "14",
         "model": "OPPO Find X7",
         "ip": "223.104.1.100",
         "ua": "Mozilla/5.0 ..."
     },
     "user": {
-        "userId": "user-abc-123",
+        "id": "user-abc-123",
         "age": 25,
         "gender": "M",
-        "interests": ["gaming", "tech"]
+        "keywords": ["gaming", "tech"]
     }
 }
 ```
+
+> 字段映射（对外 JSON ↔ Java 内部字段）：
+> `id`↔`requestId`、`tagid`↔`adSlotId`、`device.osv`↔`osVersion`、`user.id`↔`userId`、`user.keywords`↔`interests`。
+> 通过 `@JsonProperty` 实现：内部保留可读命名，对外协议遵循 OpenRTB。`age` 暂保留（OpenRTB 用 `yob` 出生年，留待后续）。
+> 注意：SSP→媒体的响应（下方）属私有协议，不在 OpenRTB 范围，沿用 `requestId`/`adSlotId`。
 
 成功响应（200）：
 

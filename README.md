@@ -190,10 +190,10 @@ POST /api/v1/bid
 ```json
 // 请求
 {
-  "requestId": "req-001",
-  "adSlotId": "slot-test-001",
+  "id": "req-001",
+  "tagid": "slot-test-001",
   "device": { "os": "iOS" },
-  "user": { "userId": "u1" }
+  "user": { "id": "u1" }
 }
 
 // 响应（中标）

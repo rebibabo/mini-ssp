@@ -150,7 +150,7 @@ send_bids() {
   echo "--- 发送 ${REQUEST_COUNT} 个竞价请求 → slot=${SLOT_ID} ---"
   for ((i = 1; i <= REQUEST_COUNT; i++)); do
     rid="req-${TIMESTAMP}-${i}"
-    req="{\"requestId\":\"${rid}\",\"adSlotId\":\"${SLOT_ID}\",\"device\":{\"os\":\"iOS\"},\"user\":{\"userId\":\"u1\"}}"
+    req="{\"id\":\"${rid}\",\"tagid\":\"${SLOT_ID}\",\"device\":{\"os\":\"iOS\"},\"user\":{\"id\":\"u1\"}}"
     resp="$(curl -s -X POST -H "Content-Type: application/json" -d "${req}" \
       "http://localhost:${SSP_PORT}/api/v1/bid" 2>/dev/null || true)"
     # 响应为空(网络错等)时填 null，保证写出的仍是合法 JSON 行

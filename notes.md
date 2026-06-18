@@ -2304,6 +2304,47 @@ docker compose --profile kafka --profile metrics up -d  # 全起
 
 ---
 
+## 39. OpenRTB 字段对齐（@JsonProperty 解耦内部模型与线上协议）
+
+### 背景
+
+DTO 字段原本是自定义命名（`requestId`/`adSlotId`/`floorPrice`...），跟着 OpenRTB 2.5 规范化，
+让对外 JSON 用协议标准 key（`id`/`tagid`/`bidfloor`...）。
+
+### 核心手法：`@JsonProperty`
+
+```java
+@JsonProperty("id")
+private String requestId;   // Java 内部仍叫 requestId，对外 JSON 收发是 "id"
+```
+
+- **双向**：序列化输出用新 key，反序列化输入也只认新 key（旧 key 会收不到值）。
+- **解耦**：内部代码 `getRequestId()` 一行不用改，只有 JSON 协议层变。
+- 这正是生产做法——**内部领域模型命名 ≠ 线上契约命名**，互不绑架。
+
+### 哪些该改、哪些不该
+
+| 边界 | DTO | 是否 OpenRTB | 处理 |
+|---|---|---|---|
+| 媒体→SSP | `BidRequest`/`Device`/`User` | 建模自 OpenRTB | 改：`id`/`tagid`/`osv`/`keywords` |
+| **SSP↔DSP** | `DspBidRequest`/`DspBidResponse` | **正是 OpenRTB 接口** | 改：`id`/`tagid`/`bidfloor`/`price` |
+| SSP→媒体 | `BidResponse` | ✗ 私有协议 | 不动 |
+| DB 落库 | `BidLog`/`EventLog` | ✗ 内部存储 | 不动（改了还连累列映射） |
+
+### 易踩的坑
+
+1. **跨项目要两边同步**：SSP 和 mock-dsp 各有一份 `DspBidRequest/Response`，
+   一边加 `@JsonProperty` 另一边不加 → 反序列化丢字段。
+2. **改名不是改语义**：`age→yob`（年龄→出生年）值含义不同，不属于纯改名，单独处理。
+3. **示例/脚本要同步**：README、`test-modeB.sh` 里 curl 的请求体 key 也得改，否则 400。
+
+### 一句话（面试可讲）
+
+> OpenRTB 只规范 SSP↔DSP 的竞价交互；我用 `@JsonProperty` 让对外 JSON 遵循 OpenRTB 2.5，
+> 同时保留内部可读命名，做到协议层与领域模型解耦。
+
+---
+
 ### 项目总结
 
 **从零做完了一个完整的 mini-SSP**，覆盖：
