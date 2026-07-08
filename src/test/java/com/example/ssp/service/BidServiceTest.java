@@ -65,7 +65,8 @@ class BidServiceTest {
         // 现有用例断言的是一价行为(winPrice==最高出价)，传入 FirstPricePricing
         meterRegistry = new SimpleMeterRegistry();
         bidService = new BidService(slotCacheService, trackService, bidLogWriter,
-                dspCaller, rateLimiter, frequencyCapService, new FirstPricePricing(), meterRegistry, Runnable::run);
+                dspCaller, rateLimiter, frequencyCapService, new FirstPricePricing(), meterRegistry,
+                Runnable::run, Runnable::run);
         // 单元测试没有开spring容器，所以@Value 字段不会根据yml配置文件注入
         // 手动设置，这是springboot把反射包装成测试好用的工具
         // bidService.globalTimeoutMs=200
@@ -198,7 +199,8 @@ class BidServiceTest {
         // 用真实线程池，让 dsp-B 的调用故意 sleep 超过 globalTimeoutMs，触发超时
         ExecutorService executor = Executors.newFixedThreadPool(2);
         BidService realBidService = new BidService(slotCacheService, trackService, bidLogWriter,
-                dspCaller, rateLimiter, frequencyCapService, new FirstPricePricing(), meterRegistry, executor);
+                dspCaller, rateLimiter, frequencyCapService, new FirstPricePricing(), meterRegistry,
+                executor, executor);
         ReflectionTestUtils.setField(realBidService, "globalTimeoutMs", 100L);
 
         when(slotCacheService.getSlot("slot-1")).thenReturn(buildSlot("slot-1", "1.0"));

@@ -10,12 +10,14 @@ Mini-SSP 压力测试脚本
 """
 
 import argparse
+import csv
 import time
 import uuid
 import json
 import statistics
 import urllib.request
 import urllib.error
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
@@ -38,8 +40,8 @@ def send_one(url: str, slot_id: str) -> tuple[str, float]:
     result 是 "fill" / "no_fill" / "error"。
     """
     payload = json.dumps({
-        "requestId": str(uuid.uuid4()),   # 每次随机，避免命中 bid_result 缓存影响结果
-        "adSlotId": slot_id,
+        "id": str(uuid.uuid4()),   # 每次随机，避免命中 bid_result 缓存影响结果
+        "tagid": slot_id,
         "device": {"os": "iOS"}
     }).encode()
 
@@ -83,31 +85,69 @@ def percentile(data: list[float], p: float) -> float:
     return sorted_data[idx]
 
 
-def print_report(scenario: str, concurrency: int, duration: int, elapsed: float):
+def build_report(scenario: str, concurrency: int, duration: int, elapsed: float) -> dict:
     total    = sum(results.values())
     fill     = results["fill"]
     no_fill  = results["no_fill"]
     errors   = results["error"]
-    qps      = total / elapsed
+    qps      = total / elapsed if elapsed else 0.0
+
+    return {
+        "scenario": scenario,
+        "concurrency": concurrency,
+        "duration_s": duration,
+        "elapsed_s": elapsed,
+        "total": total,
+        "qps": qps,
+        "fill": fill,
+        "fill_rate": fill / total * 100 if total else 0.0,
+        "no_fill": no_fill,
+        "no_fill_rate": no_fill / total * 100 if total else 0.0,
+        "error": errors,
+        "error_rate": errors / total * 100 if total else 0.0,
+        "p50_ms": percentile(latencies, 50) if latencies else 0.0,
+        "p95_ms": percentile(latencies, 95) if latencies else 0.0,
+        "p99_ms": percentile(latencies, 99) if latencies else 0.0,
+        "max_ms": max(latencies) if latencies else 0.0,
+        "avg_ms": statistics.mean(latencies) if latencies else 0.0,
+    }
+
+
+def print_report(report: dict):
+    total    = report["total"]
+    fill     = report["fill"]
+    no_fill  = report["no_fill"]
+    errors   = report["error"]
 
     print()
     print("=" * 52)
-    print(f"  场景：{scenario}")
-    print(f"  并发：{concurrency}  持续：{duration}s  实际耗时：{elapsed:.1f}s")
+    print(f"  场景：{report['scenario']}")
+    print(f"  并发：{report['concurrency']}  持续：{report['duration_s']}s  实际耗时：{report['elapsed_s']:.1f}s")
     print("=" * 52)
     print(f"  总请求数   : {total}")
-    print(f"  吞吐量     : {qps:.1f} req/s")
-    print(f"  fill       : {fill}  ({fill/total*100:.1f}%)" if total else "  fill: 0")
-    print(f"  no_fill    : {no_fill}  ({no_fill/total*100:.1f}%)" if total else "  no_fill: 0")
-    print(f"  error      : {errors}  ({errors/total*100:.1f}%)" if total else "  error: 0")
-    if latencies:
-        print(f"  P50 延迟   : {percentile(latencies, 50):.1f} ms")
-        print(f"  P95 延迟   : {percentile(latencies, 95):.1f} ms")
-        print(f"  P99 延迟   : {percentile(latencies, 99):.1f} ms")
-        print(f"  最大延迟   : {max(latencies):.1f} ms")
-        print(f"  平均延迟   : {statistics.mean(latencies):.1f} ms")
+    print(f"  吞吐量     : {report['qps']:.1f} req/s")
+    print(f"  fill       : {fill}  ({report['fill_rate']:.1f}%)" if total else "  fill: 0")
+    print(f"  no_fill    : {no_fill}  ({report['no_fill_rate']:.1f}%)" if total else "  no_fill: 0")
+    print(f"  error      : {errors}  ({report['error_rate']:.1f}%)" if total else "  error: 0")
+    if report["p50_ms"]:
+        print(f"  P50 延迟   : {report['p50_ms']:.1f} ms")
+        print(f"  P95 延迟   : {report['p95_ms']:.1f} ms")
+        print(f"  P99 延迟   : {report['p99_ms']:.1f} ms")
+        print(f"  最大延迟   : {report['max_ms']:.1f} ms")
+        print(f"  平均延迟   : {report['avg_ms']:.1f} ms")
     print("=" * 52)
     print()
+
+
+def append_csv(path: str, report: dict):
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not output.exists()
+    with output.open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(report.keys()))
+        if write_header:
+            writer.writeheader()
+        writer.writerow(report)
 
 
 def run(url: str, slot_id: str, concurrency: int, duration: int, scenario: str):
@@ -124,7 +164,9 @@ def run(url: str, slot_id: str, concurrency: int, duration: int, scenario: str):
             f.result()   # 等所有 worker 结束，传播异常（如有）
 
     elapsed = time.time() - t0
-    print_report(scenario, concurrency, duration, elapsed)
+    report = build_report(scenario, concurrency, duration, elapsed)
+    print_report(report)
+    return report
 
 
 def main():
@@ -134,13 +176,19 @@ def main():
     parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
     parser.add_argument("--duration",    type=int, default=DEFAULT_DURATION)
     parser.add_argument("--scenario",    default="压测")
+    parser.add_argument("--csv-output",  help="把本次压测结果追加写入 CSV 文件")
     args = parser.parse_args()
 
     try:
-        run(args.url, args.slot, args.concurrency, args.duration, args.scenario)
+        report = run(args.url, args.slot, args.concurrency, args.duration, args.scenario)
+        if args.csv_output:
+            append_csv(args.csv_output, report)
     except KeyboardInterrupt:
         print("\n压测被中断，输出当前统计：")
-        print_report(args.scenario, args.concurrency, args.duration, DEFAULT_DURATION)
+        report = build_report(args.scenario, args.concurrency, args.duration, DEFAULT_DURATION)
+        print_report(report)
+        if args.csv_output:
+            append_csv(args.csv_output, report)
 
 
 if __name__ == "__main__":

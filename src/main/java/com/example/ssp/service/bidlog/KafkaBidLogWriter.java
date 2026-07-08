@@ -2,6 +2,7 @@ package com.example.ssp.service.bidlog;
 
 import com.example.ssp.model.entity.BidLog;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.kafka.core.KafkaTemplate;
@@ -18,6 +19,7 @@ import java.util.List;
  * <p>send 非阻塞（只入 producer 缓冲，客户端后台线程发送），不占竞价线程。
  * key 用 requestId：同一次竞价的多条进同一分区，保证有序、便于排查。</p>
  */
+@Slf4j
 @Component
 @RequiredArgsConstructor
 @ConditionalOnProperty(name = "ssp.bid-log.mode", havingValue = "kafka")
@@ -28,10 +30,17 @@ public class KafkaBidLogWriter implements BidLogWriter {
     @Value("${ssp.kafka.bid-log-topic:bid-log}")
     private String bidLogTopic;
 
+    @Value("${ssp.trace.timeline-enabled:false}")
+    private boolean timelineTraceEnabled;
+
     @Override
     public void write(List<BidLog> logs) {
         for (BidLog log : logs) {
             kafkaTemplate.send(bidLogTopic, log.getRequestId(), log);
+        }
+        if (timelineTraceEnabled && logs != null && !logs.isEmpty()) {
+            log.info("[Timeline] requestId={} stage=\"kafka producer accepted bid_log messages\" count={}",
+                    logs.get(0).getRequestId(), logs.size());
         }
     }
 }

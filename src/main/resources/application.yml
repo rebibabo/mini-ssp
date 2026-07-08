@@ -26,7 +26,7 @@ spring:
     name: mini-ssp
   datasource:
     # 敏感信息从环境变量/.env 读取（spring-dotenv 自动加载根目录 .env）；冒号后是本地默认值
-    url: ${DB_URL:jdbc:mysql://localhost:3306/mini_ssp?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8}
+    url: ${DB_URL:jdbc:mysql://localhost:3306/mini_ssp?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8&allowPublicKeyRetrieval=true}
     username: ${DB_USERNAME:root}
     password: ${DB_PASSWORD}
     driver-class-name: com.mysql.cj.jdbc.Driver
@@ -48,7 +48,7 @@ spring:
       value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
       properties:
         # 反序列化 JSON 回对象时，信任这个包下的类(安全限制，防止反序列化任意类)
-        spring.json.trusted.packages: com.example.ssp.model.entity
+        spring.json.trusted.packages: com.example.ssp.model.entity,com.example.ssp.model.dto
     listener:
       type: batch                           # 批量消费：监听方法收 List，为批量入库做准备
 
@@ -63,11 +63,25 @@ ssp:
     mode: direct                            # bid_log 落库方式：direct=同步直写MySQL(默认,无需Kafka) | kafka=发Kafka消费者批量入库
   kafka:
     bid-log-topic: bid-log                  # bid_log 消息的 topic 名(仅 kafka 模式用)
+    bid-log-batch-topic: bid-log-batch      # bid_log 批量消息 topic(仅 kafka-batch 模式用)
+    bid-log-batch-group: ssp-bidlog-batch-consumer
   dsp:
     # DSP 调用模式：mock=进程内模拟(默认,无需启动DSP服务) | http=WebClient 真实调用 8081-8083 的 Mock DSP
     mode: mock
   freq:
     daily-cap: 3                            # 同一用户对同一 DSP 广告每天最多展示次数(0=不限)
+  track:
+    save-bid-result-enabled: true           # 是否缓存中标结果，供曝光/点击追踪查询
+    save-bid-result-mode: sync              # sync=同步写Redis | async=每请求提交异步任务 | batch=队列+pipeline批量写
+    save-bid-result-async: false            # 是否异步写 bid_result；默认同步保证追踪立即可查
+    bid-result-batch-size: 200
+    bid-result-flush-interval-ms: 5
+    bid-result-queue-capacity: 50000
+    executor:
+      core-size: 2
+      max-size: 4
+      queue-capacity: 10000
+      keep-alive-seconds: 60
   bid:
     global-timeout-ms: 200
     default-dsp-timeout-ms: 150
@@ -76,12 +90,14 @@ ssp:
     # 二价增量
     price-increment: 0.01
     thread-pool:
-      core-size: 8
-      max-size: 16
-      queue-capacity: 200
+      core-size: 200
+      max-size: 600
+      queue-capacity: 300
       keep-alive-seconds: 60
   cache:
-    enabled: false
+    enabled: true
+    local-enabled: false                    # 是否把 slot/dsp 配置加载到 JVM 本地内存，竞价请求直接读内存
+    local-refresh-ms: 5000                  # 本地配置缓存定时兜底刷新间隔
     slot-ttl-minutes: 10
     dsp-ttl-minutes: 10
     bid-result-ttl-minutes: 5

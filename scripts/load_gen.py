@@ -51,8 +51,8 @@ def pick_slot():
 def send_request():
     """发一个竞价请求，返回 'fill' / 'no_fill' / 'error'"""
     payload = json.dumps({
-        "requestId": str(uuid.uuid4()),
-        "adSlotId": pick_slot(),
+        "id": str(uuid.uuid4()),
+        "tagid": pick_slot(),
         "device": {"os": random.choice(["iOS", "Android"])}
     }).encode()
 

@@ -57,6 +57,9 @@ public class BidService {
     @Qualifier("bidExecutor")
     private final Executor bidExecutor;
 
+    @Qualifier("trackExecutor")
+    private final Executor trackExecutor;
+
     // @Value 从 application.yml 读取全局竞价超时（默认 200ms）；单元测试无容器，需用 ReflectionTestUtils 手动设值
     @Value("${ssp.bid.global-timeout-ms:200}")
     private long globalTimeoutMs;
@@ -65,24 +68,44 @@ public class BidService {
     @Value("${ssp.freq.daily-cap:3}")
     private int freqDailyCap;
 
+    @Value("${ssp.track.save-bid-result-enabled:true}")
+    private boolean saveBidResultEnabled = true;
+
+    @Value("${ssp.track.save-bid-result-async:false}")
+    private boolean saveBidResultAsync;
+
+    @Value("${ssp.track.save-bid-result-mode:}")
+    private String saveBidResultMode = "";
+
+    @Value("${ssp.metrics.enabled:true}")
+    private boolean metricsEnabled = true;
+
+
+    @Value("${ssp.trace.timeline-enabled:false}")
+    private boolean timelineTraceEnabled;
+
     /**
      * 核心竞价入口
      */
     public BidResponse processBid(BidRequest request) {
         // 整次竞价的总耗时：不管从哪个 return 出去，finally 都会执行并记录
-        Timer.Sample sample = Timer.start(meterRegistry);
+        Timer.Sample sample = metricsEnabled ? Timer.start(meterRegistry) : null;
+        long traceStartNs = System.nanoTime();
+        long lastTraceNs = traceStartNs;
         try {
             // 1. 查广告位（走缓存）
             AdSlot adSlot = slotCacheService.getSlot(request.getAdSlotId());
+            lastTraceNs = trace(request.getRequestId(), "slot lookup", traceStartNs, lastTraceNs);
             if (adSlot == null) {
                 throw new BizException(404, "广告位不存在或已禁用: " + request.getAdSlotId());
             }
 
             // 2. 查关联的 DSP 列表（走缓存）
             List<DspConfig> dsps = slotCacheService.getDspsForSlot(request.getAdSlotId());
+            lastTraceNs = trace(request.getRequestId(), "dsp list lookup, count=" + dsps.size(), traceStartNs, lastTraceNs);
             if (dsps.isEmpty()) {
                 log.warn("[Bid] no dsps for slot {}", request.getAdSlotId());
-                meterRegistry.counter("ssp_bid_requests_total", "result", "no_fill").increment();
+                incrementBidCounter("no_fill");
                 return null;  // no fill
             }
 
@@ -95,10 +118,11 @@ public class BidService {
                         .toList();
                 if (dsps.isEmpty()) {
                     log.info("[Bid] all dsps frequency-capped for user {}, slot {}", uid, request.getAdSlotId());
-                    meterRegistry.counter("ssp_bid_requests_total", "result", "no_fill").increment();
+                    incrementBidCounter("no_fill");
                     return null;  // no fill
                 }
             }
+            lastTraceNs = trace(request.getRequestId(), "frequency cap check", traceStartNs, lastTraceNs);
 
             // 3. 并发向每个 DSP 发起竞价
             // 每个 DSP 在 bidExecutor 线程池里独立执行，互不阻塞
@@ -130,6 +154,7 @@ public class BidService {
                         });
                 futures.add(future);
             }
+            lastTraceNs = trace(request.getRequestId(), "submit dsp tasks, count=" + futures.size(), traceStartNs, lastTraceNs);
 
             // 4. 等待所有 DSP 响应（最长 globalTimeoutMs）
             // allOf 相当于闹钟：等所有 Future 完成，或到 globalTimeoutMs 就不等了继续往下走
@@ -146,11 +171,11 @@ public class BidService {
                 // 找出还没 isDone() 的，按 dsp_id 打 timeout 计数
                 for (int i = 0; i < dsps.size(); i++) {
                     if (!futures.get(i).isDone()) {
-                        meterRegistry.counter("ssp_dsp_bid_total",
-                                "dsp_id", dsps.get(i).getDspId(), "result", "timeout").increment();
+                        incrementDspCounter(dsps.get(i).getDspId(), "timeout");
                     }
                 }
             }
+            lastTraceNs = trace(request.getRequestId(), "wait dsp tasks", traceStartNs, lastTraceNs);
 
             // 5. 收集结果并过滤
             // allResults：所有在超时前完成的 DSP 结果（含未出价、出价低于底价的），用于写 bid_log
@@ -165,11 +190,15 @@ public class BidService {
                     .filter(r -> r.getResponse() != null && r.getResponse().isValid())  // 出价 > 0
                     .filter(r -> r.getResponse().getBidPrice().compareTo(adSlot.getFloorPrice()) >= 0)  // 出价 >= 底价
                     .toList();
+            lastTraceNs = trace(request.getRequestId(),
+                    "collect/filter dsp results, all=" + allResults.size() + ", valid=" + results.size(),
+                    traceStartNs, lastTraceNs);
 
             // 6. 选出最高出价
             DspBidResult winner = results.stream()
                     .max(Comparator.comparing(r -> r.getResponse().getBidPrice()))
                     .orElse(null);
+            lastTraceNs = trace(request.getRequestId(), "select winner", traceStartNs, lastTraceNs);
 
             String winnerId = winner != null ? winner.getDspId() : null;
 
@@ -183,24 +212,31 @@ public class BidService {
                         .toList();
                 winPrice = pricingStrategy.computeWinPrice(sortedBids, adSlot.getFloorPrice());
             }
+            lastTraceNs = trace(request.getRequestId(), "pricing", traceStartNs, lastTraceNs);
 
             // 8. 落库本次竞价的 bid_log(直写 or Kafka 由 BidLogWriter 决定)：传赢家 dspId 标记 win，成交价写到中标那条
             writeBidLogs(request.getRequestId(), request.getAdSlotId(), allResults, winnerId, winPrice);
+            lastTraceNs = trace(request.getRequestId(), "bid_log writer returned", traceStartNs, lastTraceNs);
 
             if (winner == null) {
-                meterRegistry.counter("ssp_bid_requests_total", "result", "no_fill").increment();
+                incrementBidCounter("no_fill");
                 return null;  // no fill
             }
 
             BidResponse bidResponse = buildBidResponse(request, winner, winPrice);
+            lastTraceNs = trace(request.getRequestId(), "build response", traceStartNs, lastTraceNs);
 
             // 8. 把竞价结果存进 Redis，供后续曝光/点击埋点查询
-            trackService.saveBidResult(bidResponse);
+            saveBidResult(bidResponse);
+            lastTraceNs = trace(request.getRequestId(), "save bid_result returned", traceStartNs, lastTraceNs);
 
-            meterRegistry.counter("ssp_bid_requests_total", "result", "fill").increment();
+            incrementBidCounter("fill");
+            trace(request.getRequestId(), "processBid return", traceStartNs, lastTraceNs);
             return bidResponse;
         } finally {
-            sample.stop(meterRegistry.timer("ssp_bid_duration_seconds"));
+            if (sample != null) {
+                sample.stop(meterRegistry.timer("ssp_bid_duration_seconds"));
+            }
         }
     }
 
@@ -227,13 +263,13 @@ public class BidService {
             DspBidResponse response = dspCaller.bid(dsp, dspRequest);
             // 从发出请求到收到 DSP 响应的耗时（毫秒），用于写入 bid_log 做性能分析
             int elapsedMs = (int) (System.currentTimeMillis() - dspStart);
-            meterRegistry.timer("ssp_dsp_call_duration_seconds", "dsp_id", dsp.getDspId())
-                    .record(Duration.ofMillis(elapsedMs));
+            trace(dspRequest.getRequestId(), "dsp call finished, dsp=" + dsp.getDspId() + ", elapsedMs=" + elapsedMs);
+            recordDspTimer(dsp.getDspId(), elapsedMs);
             return DspBidResult.success(dsp.getDspId(), response, elapsedMs);
         } catch (Exception e) {
             int elapsedMs = (int) (System.currentTimeMillis() - dspStart);
-            meterRegistry.timer("ssp_dsp_call_duration_seconds", "dsp_id", dsp.getDspId())
-                    .record(Duration.ofMillis(elapsedMs));
+            trace(dspRequest.getRequestId(), "dsp call failed, dsp=" + dsp.getDspId() + ", elapsedMs=" + elapsedMs);
+            recordDspTimer(dsp.getDspId(), elapsedMs);
             log.error("[Bid] callDsp {} failed: {}", dsp.getDspId(), e.getMessage());
             return DspBidResult.error(dsp.getDspId(), elapsedMs);
         }
@@ -272,13 +308,78 @@ public class BidService {
             bidLog.setWinPrice(isWinner ? winPrice : null);
 
             // 按 (dsp_id, result) 维度统计每个 DSP 的出价结果
-            meterRegistry.counter("ssp_dsp_bid_total", "dsp_id", result.getDspId(),
-                    "result", dspResultTag(bidLog.getStatus(), isWinner)).increment();
+            incrementDspCounter(result.getDspId(), dspResultTag(bidLog.getStatus(), isWinner));
 
             logs.add(bidLog);
         }
         // 落库策略：DirectBidLogWriter 同步单条 / KafkaBidLogWriter 发 Kafka 由消费者批量入库
         bidLogWriter.write(logs);
+    }
+
+    private void incrementBidCounter(String result) {
+        if (metricsEnabled) {
+            meterRegistry.counter("ssp_bid_requests_total", "result", result).increment();
+        }
+    }
+
+    private void incrementDspCounter(String dspId, String result) {
+        if (metricsEnabled) {
+            meterRegistry.counter("ssp_dsp_bid_total", "dsp_id", dspId, "result", result).increment();
+        }
+    }
+
+    private void recordDspTimer(String dspId, int elapsedMs) {
+        if (metricsEnabled) {
+            meterRegistry.timer("ssp_dsp_call_duration_seconds", "dsp_id", dspId)
+                    .record(Duration.ofMillis(elapsedMs));
+        }
+    }
+
+    private void saveBidResult(BidResponse bidResponse) {
+        if (!saveBidResultEnabled) {
+            return;
+        }
+
+        String mode = saveBidResultMode == null ? "" : saveBidResultMode.trim().toLowerCase();
+        if ("batch".equals(mode)) {
+            trackService.saveBidResultBatchAsync(bidResponse);
+            return;
+        }
+
+        boolean asyncMode = "async".equals(mode) || (mode.isEmpty() && saveBidResultAsync);
+        if (!asyncMode) {
+            trackService.saveBidResult(bidResponse);
+            return;
+        }
+
+        trackExecutor.execute(() -> {
+            try {
+                trackService.saveBidResult(bidResponse);
+            } catch (Exception e) {
+                log.error("[Track] async save bid result failed, requestId={}: {}",
+                        bidResponse.getRequestId(), e.getMessage());
+            }
+        });
+    }
+
+    private long trace(String requestId, String stage, long startNs, long previousNs) {
+        if (!timelineTraceEnabled) {
+            return System.nanoTime();
+        }
+        long now = System.nanoTime();
+        log.info("[Timeline] requestId={} stage=\"{}\" stepMs={} totalMs={}",
+                requestId, stage, nanosToMillis(now - previousNs), nanosToMillis(now - startNs));
+        return now;
+    }
+
+    private void trace(String requestId, String stage) {
+        if (timelineTraceEnabled) {
+            log.info("[Timeline] requestId={} stage=\"{}\"", requestId, stage);
+        }
+    }
+
+    private double nanosToMillis(long nanos) {
+        return Math.round(nanos / 10_000.0) / 100.0;
     }
 
     // 把 bid_log 的 status/win 映射成 Metrics 的 result tag：win/lose/no_bid/error/rate_limited

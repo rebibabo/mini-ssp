@@ -13,6 +13,8 @@ import java.util.List;
  * <ul>
  *   <li>{@code direct}（默认）→ DirectBidLogWriter：同步单条 insert，无需 Kafka/Docker</li>
  *   <li>{@code kafka} → KafkaBidLogWriter：发 Kafka，消费者批量 insertBatch</li>
+ *   <li>{@code kafka-batch} → KafkaBatchBidLogWriter：一次竞价发一条 Kafka 消息</li>
+ *   <li>{@code none} → NoopBidLogWriter：压测时跳过写入，只测竞价主链路</li>
  * </ul>
  * 和 DspCaller / PricingStrategy 一样是策略模式。
  */

@@ -2,6 +2,7 @@ package com.example.ssp.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.example.ssp.cache.SlotCacheService;
 import com.example.ssp.exception.BizException;
 import com.example.ssp.mapper.AdSlotMapper;
 import com.example.ssp.model.dto.AdSlotDTO;
@@ -14,6 +15,7 @@ import org.springframework.stereotype.Service;
 public class SlotService {
 
     private final AdSlotMapper adSlotMapper;
+    private final SlotCacheService slotCacheService;
 
     public AdSlot create(AdSlotDTO dto) {
         // 检查 slotId 是否已存在
@@ -35,6 +37,7 @@ public class SlotService {
         slot.setStatus(dto.getStatus());
 
         adSlotMapper.insert(slot);
+        slotCacheService.evictSlot(slot.getSlotId());
         return slot;
     }
 
@@ -60,11 +63,13 @@ public class SlotService {
         slot.setStatus(dto.getStatus());
 
         adSlotMapper.updateById(slot);
+        slotCacheService.evictSlot(slot.getSlotId());
         return slot;
     }
 
     public void delete(Long id) {
-        getById(id); // 检查是否存在
+        AdSlot slot = getById(id); // 检查是否存在
         adSlotMapper.deleteById(id);
+        slotCacheService.evictSlot(slot.getSlotId());
     }
 }

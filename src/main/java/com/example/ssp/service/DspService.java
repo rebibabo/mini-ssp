@@ -2,6 +2,7 @@ package com.example.ssp.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.example.ssp.cache.SlotCacheService;
 import com.example.ssp.exception.BizException;
 import com.example.ssp.mapper.DspConfigMapper;
 import com.example.ssp.model.dto.DspConfigDTO;
@@ -14,6 +15,7 @@ import org.springframework.stereotype.Service;
 public class DspService {
 
     private final DspConfigMapper dspConfigMapper;
+    private final SlotCacheService slotCacheService;
 
     public DspConfig create(DspConfigDTO dto) {
         // 检查 dspId 是否已存在
@@ -34,6 +36,7 @@ public class DspService {
         dsp.setStatus(dto.getStatus());
 
         dspConfigMapper.insert(dsp); // 向数据库插入dsp
+        slotCacheService.refreshLocalCache();
         return dsp;
     }
 
@@ -58,11 +61,13 @@ public class DspService {
         dsp.setStatus(dto.getStatus());
 
         dspConfigMapper.updateById(dsp);
+        slotCacheService.refreshLocalCache();
         return dsp;
     }
 
     public void delete(Long id) {
         getById(id); // 检查是否存在
         dspConfigMapper.deleteById(id);
+        slotCacheService.refreshLocalCache();
     }
 }

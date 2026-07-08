@@ -4,6 +4,7 @@ import com.example.ssp.mapper.BidLogMapper;
 import com.example.ssp.model.entity.BidLog;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
@@ -28,12 +29,24 @@ public class BidLogConsumer {
 
     private final BidLogMapper bidLogMapper;
 
+    @Value("${ssp.trace.timeline-enabled:false}")
+    private boolean timelineTraceEnabled;
+
     @KafkaListener(topics = "${ssp.kafka.bid-log-topic:bid-log}")
     public void consume(List<BidLog> logs) {
         if (logs == null || logs.isEmpty()) {
             return;
         }
+        long startNs = System.nanoTime();
         bidLogMapper.insertBatch(logs);
+        if (timelineTraceEnabled) {
+            log.info("[Timeline] requestId={} stage=\"kafka consumer inserted bid_log to MySQL\" count={} stepMs={}",
+                    logs.get(0).getRequestId(), logs.size(), nanosToMillis(System.nanoTime() - startNs));
+        }
         log.debug("[BidLogConsumer] 批量入库 {} 条 bid_log", logs.size());
+    }
+
+    private double nanosToMillis(long nanos) {
+        return Math.round(nanos / 10_000.0) / 100.0;
     }
 }

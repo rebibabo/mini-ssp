@@ -6,18 +6,21 @@
 #   ./start.sh --kafka           # 加 Kafka（bid-log 异步写入）
 #   ./start.sh --metrics         # 加监控（Prometheus + Grafana）
 #   ./start.sh --kafka --metrics # 全量
+#   ./start.sh --perf            # 本机压测模式（跳过 bid_log 写入 + perf profile）
 #   ./start.sh --down            # 停止 Docker 服务（Java app 请手动 Ctrl+C）
 
 set -e
 
 KAFKA=false
 METRICS=false
+PERF=false
 DOWN=false
 
 for arg in "$@"; do
   case $arg in
     --kafka)   KAFKA=true ;;
     --metrics) METRICS=true ;;
+    --perf)    PERF=true ;;
     --down)    DOWN=true ;;
     --help|-h)
       sed -n '2,9p' "$0" | sed 's/^# \?//'
@@ -81,7 +84,8 @@ fi
 echo ""
 
 APP_ARGS=""
-$KAFKA && APP_ARGS="--ssp.bid-log.mode=kafka"
+$KAFKA && APP_ARGS="$APP_ARGS --ssp.bid-log.mode=kafka"
+$PERF && APP_ARGS="$APP_ARGS --spring.profiles.active=perf"
 
 if [ -n "$APP_ARGS" ]; then
   ./mvnw spring-boot:run -Dspring-boot.run.arguments="$APP_ARGS"

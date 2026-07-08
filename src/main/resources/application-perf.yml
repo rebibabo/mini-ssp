@@ -1,0 +1,54 @@
+# High-throughput local benchmark profile.
+# Run with: ./start.sh --perf
+
+mybatis-plus:
+  configuration:
+    log-impl: org.apache.ibatis.logging.nologging.NoLoggingImpl
+
+spring:
+  datasource:
+    hikari:
+      minimum-idle: 0
+      initialization-fail-timeout: -1
+
+ssp:
+  perf:
+    static-config-enabled: false
+  bid-log:
+    mode: none
+  track:
+    save-bid-result-enabled: true
+    save-bid-result-mode: async
+    save-bid-result-async: true
+    bid-result-batch-size: 200
+    bid-result-flush-interval-ms: 5
+    bid-result-queue-capacity: 50000
+    executor:
+      core-size: 2
+      max-size: 4
+      queue-capacity: 20000
+      keep-alive-seconds: 60
+  dsp:
+    mode: mock
+    mock-random-seed: 1
+    mock-latency-ms: ${SSP_MOCK_LATENCY_MS:0}
+  bid:
+    global-timeout-ms: 200
+    default-dsp-timeout-ms: 150
+    thread-pool:
+      core-size: 200
+      max-size: 300
+      queue-capacity: 300
+      keep-alive-seconds: 60
+  cache:
+    enabled: true
+    local-enabled: true
+    local-refresh-ms: 5000
+
+logging:
+  level:
+    root: WARN
+    com.example.ssp: WARN
+    org.mybatis: WARN
+    org.springframework.kafka: WARN
+    reactor.netty: WARN
